@@ -1,0 +1,41 @@
+{
+  "$schema": "https://arisen.dev/schemas/package-v2.json",
+  "id": "com.arisen.terrain",
+  "name": "Arisen Terrain",
+  "version": "1.0.0",
+  "layer": "domain",
+  "author": "Arisen Team",
+  "description": "Backend-neutral terrain assets, streaming state, queries, and LOD planning.",
+  "services": {
+    "provides": [
+      "ArisenEngine.Terrain.ITerrainTileRenderSource",
+      "ArisenEngine.Terrain.ITerrainRuntimeDataStore",
+      "ArisenEngine.Terrain.ITerrainQueryService",
+      "ArisenEngine.Terrain.ITerrainLodPlanner",
+      "ArisenEngine.Terrain.ITerrainDiagnostics",
+      "ArisenEngine.Terrain.ITerrainDiagnosticsPublisher",
+      "ArisenEngine.Terrain.ITerrainResidencyDiagnostics",
+      "ArisenEngine.Terrain.ITerrainAuthoringPreviewService"
+    ],
+    "requires": [
+      "ArisenEngine.Core.Assets.IAssetDatabase",
+      "ArisenEngine.Core.Assets.IRuntimeAssetCookerRegistry",
+      "ArisenEngine.Resources.Serialization.ISceneComponentExtensionRegistry",
+      "ArisenEngine.Resources.Serialization.IRuntimeSceneService",
+      "ArisenEngine.Resources.Serialization.IRuntimeWorldStreamingService",
+      "ArisenEngine.Resources.Serialization.IRuntimeAssetResidencyService",
+      "ArisenEngine.Resources.Serialization.IWorldOriginService",
+      "ArisenEngine.Threading.IBackgroundTaskScheduler",
+      "ArisenKernel.Lifecycle.IRuntimeSmokeScenarioRegistry"
+    ]
+  },
+  "dependencies": {
+    "com.arisen.core": "1.0.0",
+    "com.arisen.ecs": "1.0.0",
+    "com.arisen.resources": "1.0.0",
+    "com.arisen.taskgraph": "1.0.0"
+  },
+  "nugetDependencies": {
+    "YamlDotNet": "16.3.0"
+  }
+}

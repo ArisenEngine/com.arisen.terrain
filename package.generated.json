@@ -1,0 +1,6 @@
+{
+  "entry": {
+    "assembly": "Com.Arisen.Terrain.dll",
+    "class": "ArisenEngine.Terrain.TerrainPackage"
+  }
+}
