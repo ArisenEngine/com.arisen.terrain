@@ -88,27 +88,19 @@ public static class TerrainTileAssetCooker
         ArgumentNullException.ThrowIfNull(assetDatabase);
         ArgumentNullException.ThrowIfNull(tile);
         byte[] payload = WritePayload(tile);
-        string outputPath = assetDatabase.GetCookedArtifactPath(
+        using CookedArtifactWrite write = assetDatabase.BeginCookedArtifactWrite(
             tile.Guid,
             RuntimeVariant,
             CookedExtension);
-        TerrainCookedContainer.WriteAtomicallyIfChanged(outputPath, payload);
-
-        var output = new FileInfo(outputPath);
-        assetDatabase.RegisterCookedArtifact(new CookedAssetRecord(
-            tile.Guid,
-            TerrainAssetTypes.Tile,
-            RuntimeVariant,
-            output.FullName,
-            output.Length,
-            output.LastWriteTimeUtc));
+        TerrainCookedContainer.WriteAtomicallyIfChanged(write.OutputPath, payload);
+        CookedAssetRecord output = write.Commit(TerrainAssetTypes.Tile);
         return new CookedTerrainTileArtifact(
             tile.Guid,
             tile.RootGuid,
             tile.Coordinate,
             RuntimeVariant,
-            output.FullName,
-            output.Length,
+            output.Path,
+            output.SizeInBytes,
             tile.MinHeight,
             tile.MaxHeight,
             SHA256.HashData(payload));

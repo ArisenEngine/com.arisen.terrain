@@ -349,6 +349,8 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         TerrainTileDiagnosticSnapshot[] tiles = snapshot.Tiles
             .Where(tile => tile.TerrainRootGuid == root.RootGuid)
             .ToArray();
+        if (!HasCompleteRenderSnapshot(snapshot, root, tiles)) return;
+
         WorldCellId[] ownerCells = tiles
             .SelectMany(tile => tile.Owners)
             .Where(owner => owner.Kind == RuntimeAssetResidencyOwnerKind.WorldCell)
@@ -379,6 +381,43 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         SetCamera(m_OriginalCameraPosition);
         ScheduleCapture("near", checked(frameIndex + 1));
         m_Stage = TerrainStreamingSmokeStage.AwaitNearCapture;
+    }
+
+    internal static bool HasCompleteRenderSnapshot(
+        TerrainDiagnosticsSnapshot snapshot,
+        TerrainRootDiagnosticSnapshot root,
+        IReadOnlyList<TerrainTileDiagnosticSnapshot> tiles)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        ArgumentNullException.ThrowIfNull(root);
+        ArgumentNullException.ThrowIfNull(tiles);
+        if (root.TileCount <= 0 ||
+            snapshot.Lod.SourceTileCount != root.TileCount ||
+            snapshot.Lod.ResidentTileCount != root.TileCount ||
+            snapshot.Lod.SelectedPatchCount <= 0 ||
+            snapshot.Lod.OverflowPatchCount != 0 ||
+            tiles.Count != root.TileCount)
+        {
+            return false;
+        }
+
+        int patchCount = 0;
+        for (int index = 0; index < tiles.Count; index++)
+        {
+            TerrainTileDiagnosticSnapshot tile = tiles[index];
+            if (tile.TerrainRootGuid != root.RootGuid ||
+                tile.ResidencyState != RuntimePreparedAssetState.Ready ||
+                !tile.IsVisible ||
+                tile.IsFailed ||
+                tile.Patches.Count == 0)
+            {
+                return false;
+            }
+
+            patchCount = checked(patchCount + tile.Patches.Count);
+        }
+
+        return patchCount == snapshot.Lod.SelectedPatchCount;
     }
 
     private void BeginBoundaryCapture(uint frameIndex)
