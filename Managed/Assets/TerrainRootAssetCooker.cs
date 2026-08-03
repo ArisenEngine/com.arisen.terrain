@@ -287,29 +287,21 @@ public static class TerrainRootAssetCooker
     {
         CookedTerrainRoot cookedRoot = BuildRoot(root, layerSet, tileArtifacts);
         byte[] payload = WritePayload(cookedRoot);
-        string outputPath = assetDatabase.GetCookedArtifactPath(
+        using CookedArtifactWrite write = assetDatabase.BeginCookedArtifactWrite(
             root.Guid,
             RuntimeVariant,
             CookedExtension);
-        TerrainCookedContainer.WriteAtomicallyIfChanged(outputPath, payload);
-
-        var output = new FileInfo(outputPath);
-        assetDatabase.RegisterCookedArtifact(new CookedAssetRecord(
-            root.Guid,
-            TerrainAssetTypes.Root,
-            RuntimeVariant,
-            output.FullName,
-            output.Length,
-            output.LastWriteTimeUtc));
+        TerrainCookedContainer.WriteAtomicallyIfChanged(write.OutputPath, payload);
+        CookedAssetRecord output = write.Commit(TerrainAssetTypes.Root);
         RemoveStaleGeneratedTiles(assetDatabase, previousRoot, cookedRoot);
         TerrainCookedAssetDependency[] dependencies = BuildDependencies(cookedRoot);
         return new CookedTerrainRootArtifact(
             root.Guid,
             RuntimeVariant,
-            output.FullName,
+            output.Path,
             cookedRoot.Tiles.Count,
             cookedRoot.Layers.Count,
-            output.Length,
+            output.SizeInBytes,
             dependencies);
     }
 

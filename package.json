@@ -3,6 +3,9 @@
   "id": "com.arisen.terrain",
   "name": "Arisen Terrain",
   "version": "1.0.0",
+  "engine": {
+    "minVersion": "0.1.0"
+  },
   "layer": "domain",
   "author": "Arisen Team",
   "description": "Backend-neutral terrain assets, streaming state, queries, and LOD planning.",
