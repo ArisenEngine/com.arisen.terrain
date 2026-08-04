@@ -329,6 +329,8 @@ internal sealed class TerrainRuntimeDataStore : ITerrainRuntimeDataStore
 internal sealed class TerrainResidentRootData
 {
     private readonly Dictionary<TerrainTileCoordinate, CookedTerrainTileReference> m_Tiles;
+    private readonly TerrainTileAxisResolver m_XAxis;
+    private readonly TerrainTileAxisResolver m_ZAxis;
     private readonly double m_MaxX;
     private readonly double m_MaxZ;
 
@@ -348,16 +350,26 @@ internal sealed class TerrainResidentRootData
             }
         }
 
-        m_MaxX = root.WorldPlacement.X +
-                 ((root.HeightSourceWidth - 1) * root.SampleSpacing.X);
-        m_MaxZ = root.WorldPlacement.Z +
-                 ((root.HeightSourceHeight - 1) * root.SampleSpacing.Z);
-        if (!double.IsFinite(m_MaxX) || !double.IsFinite(m_MaxZ) ||
-            m_MaxX <= root.WorldPlacement.X || m_MaxZ <= root.WorldPlacement.Z)
-        {
-            throw new InvalidOperationException(
-                $"Terrain root '{root.Guid:D}' has invalid world-space coverage.");
-        }
+        int intervals = root.TileResolution - 1;
+        int tileCountX = (root.HeightSourceWidth - 1) / intervals;
+        int tileCountZ = (root.HeightSourceHeight - 1) / intervals;
+        m_XAxis = new TerrainTileAxisResolver(
+            root.Guid,
+            "X",
+            root.WorldPlacement.X,
+            root.SampleSpacing.X,
+            intervals,
+            tileCountX);
+        m_ZAxis = new TerrainTileAxisResolver(
+            root.Guid,
+            "Z",
+            root.WorldPlacement.Z,
+            root.SampleSpacing.Z,
+            intervals,
+            tileCountZ);
+        m_MaxX = m_XAxis.Maximum;
+        m_MaxZ = m_ZAxis.Maximum;
+        TerrainSurfaceSamplingDomain.Validate(root);
     }
 
     public CookedTerrainRoot Root { get; }
@@ -379,17 +391,8 @@ internal sealed class TerrainResidentRootData
             return false;
         }
 
-        int intervals = Root.TileResolution - 1;
-        double tileSizeX = intervals * Root.SampleSpacing.X;
-        double tileSizeZ = intervals * Root.SampleSpacing.Z;
-        int tileCountX = (Root.HeightSourceWidth - 1) / intervals;
-        int tileCountZ = (Root.HeightSourceHeight - 1) / intervals;
-        int localTileX = Math.Min(
-            tileCountX - 1,
-            Math.Max(0, (int)Math.Floor((worldX - Root.WorldPlacement.X) / tileSizeX)));
-        int localTileZ = Math.Min(
-            tileCountZ - 1,
-            Math.Max(0, (int)Math.Floor((worldZ - Root.WorldPlacement.Z) / tileSizeZ)));
+        int localTileX = m_XAxis.Resolve(worldX);
+        int localTileZ = m_ZAxis.Resolve(worldZ);
         var coordinate = new TerrainTileCoordinate(
             checked(Root.TileOrigin.X + localTileX),
             checked(Root.TileOrigin.Z + localTileZ));
@@ -416,13 +419,12 @@ internal sealed class TerrainResidentRootData
                 $"Terrain tile '{tile.Guid:D}' does not match resident root '{Root.Guid:D}'.");
         }
 
-        int intervals = Root.TileResolution - 1;
         int localTileX = checked(tile.Coordinate.X - Root.TileOrigin.X);
         int localTileZ = checked(tile.Coordinate.Z - Root.TileOrigin.Z);
         var expectedPlacement = new WorldPosition(
-            Root.WorldPlacement.X + (localTileX * intervals * Root.SampleSpacing.X),
+            m_XAxis.GetBoundary(localTileX),
             Root.WorldPlacement.Y,
-            Root.WorldPlacement.Z + (localTileZ * intervals * Root.SampleSpacing.Z));
+            m_ZAxis.GetBoundary(localTileZ));
         if (tile.WorldPlacement != expectedPlacement)
         {
             throw new InvalidOperationException(
