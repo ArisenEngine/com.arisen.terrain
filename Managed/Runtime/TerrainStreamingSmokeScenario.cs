@@ -165,12 +165,23 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
 
     public void Start(uint initialFrameIndex)
     {
-        m_World = m_Streaming.ActiveWorld
-            ?? throw new InvalidOperationException(
-                "Terrain-streaming smoke requires an active startup world.");
-        m_EntityManager = m_Scenes.ActiveScene?.EntityManager
-            ?? throw new InvalidOperationException(
-                "Terrain-streaming smoke requires an active persistent scene.");
+        if (!TryBeginAfterStartupWorldReady())
+        {
+            m_Stage = TerrainStreamingSmokeStage.AwaitStartupWorld;
+        }
+    }
+
+    private bool TryBeginAfterStartupWorldReady()
+    {
+        WorldDescriptor? world = m_Streaming.ActiveWorld;
+        EntityManager? entityManager = m_Scenes.ActiveScene?.EntityManager;
+        if (world == null || entityManager == null)
+        {
+            return false;
+        }
+
+        m_World = world;
+        m_EntityManager = entityManager;
         SelectPath(m_World);
         ConfigureValidationBudgets(m_World);
         CaptureCamera();
@@ -178,6 +189,7 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         m_Origin.Rebased += OnRebased;
         m_Streaming.SetStreamingSource(m_DiscoverySource);
         m_Stage = TerrainStreamingSmokeStage.AwaitDiscovery;
+        return true;
     }
 
     public void BeforeFrame(uint frameIndex)
@@ -188,6 +200,12 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
     {
         if (m_ReadyForShutdown) return;
         using var zone = Profiler.Zone("TerrainStreamingSmoke.AfterFrame");
+        if (m_Stage == TerrainStreamingSmokeStage.AwaitStartupWorld)
+        {
+            TryBeginAfterStartupWorldReady();
+            return;
+        }
+
         UpdatePeaks();
         ValidateHardBudgets();
         if (m_FailureMessage != null) return;
@@ -1149,6 +1167,7 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
 internal enum TerrainStreamingSmokeStage
 {
     None,
+    AwaitStartupWorld,
     AwaitDiscovery,
     AwaitNearCapture,
     AwaitBoundaryCapture,
