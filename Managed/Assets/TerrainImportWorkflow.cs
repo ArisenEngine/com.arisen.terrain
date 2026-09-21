@@ -29,7 +29,8 @@ public sealed record TerrainImportRequest(
     int TileResolution,
     TerrainTileCoordinate TileOrigin,
     AssetRef<TerrainLayerSetSourceAsset> LayerSet,
-    bool RegenerateRootIdentity = false);
+    bool RegenerateRootIdentity = false,
+    string? WeightSourcePath = null);
 
 public sealed record TerrainTileImportPreview(
     TerrainTileCoordinate Coordinate,
@@ -161,6 +162,7 @@ public static class TerrainImportPlanner
         string weightAssetPath = Path.Combine(outputDirectory, assetName + ".ariweights");
         string generatedDirectory = Path.Combine(outputDirectory, "Generated", assetName);
         string sourcePath = ValidateHeightSource(request.HeightSourcePath);
+        string? weightSourcePath = ValidateWeightSource(request.WeightSourcePath);
 
         ValidateLayerSet(request.LayerSet, layerSetAsset);
         _ = TerrainLayerSetSourceAssetLoader.LoadSource(layerSetAsset);
@@ -168,6 +170,7 @@ public static class TerrainImportPlanner
         ValidateWorldPartition(worldPartition);
 
         TerrainHeightField heightField = TerrainHeightSourceDecoder.DecodeFile(sourcePath);
+        TerrainWeightField? authoredWeights = DecodeAuthoredWeights(weightSourcePath, heightField);
         ValidateTileLayout(heightField.Width, heightField.Height, request.TileResolution);
         TerrainTileIdentity.ValidateCoordinate(request.TileOrigin);
 
@@ -203,6 +206,7 @@ public static class TerrainImportPlanner
         var normalizedRequest = request with
         {
             HeightSourcePath = sourcePath,
+            WeightSourcePath = weightSourcePath,
             PackageAssetsRoot = assetsRoot,
             PackageId = packageId,
             OutputDirectory = Path.GetRelativePath(assetsRoot, outputDirectory).Replace('\\', '/'),
@@ -294,7 +298,14 @@ public static class TerrainImportPlanner
             expectedAssetType: "TerrainWeightSource",
             expectedImporter: WeightImporter);
         byte[] weightBytes;
-        if (existing?.Descriptor.WeightSource is { } existingWeights &&
+        if (authoredWeights != null)
+        {
+            weightBytes = TerrainWeightSourceEncoder.Encode(
+                authoredWeights.Width,
+                authoredWeights.Height,
+                authoredWeights.Weights.Span);
+        }
+        else if (existing?.Descriptor.WeightSource is { } existingWeights &&
             existingWeights.Width == heightField.Width &&
             existingWeights.Height == heightField.Height &&
             File.Exists(existingWeights.ResolvedPath))
@@ -916,6 +927,10 @@ public static class TerrainImportPlanner
             weightAssetPath,
             weightAssetPath + ".meta"
         };
+        if (!string.IsNullOrEmpty(request.WeightSourcePath))
+        {
+            observedPaths.Add(request.WeightSourcePath);
+        }
         if (Directory.Exists(generatedDirectory))
         {
             foreach (string path in Directory.EnumerateFiles(
@@ -1091,6 +1106,51 @@ public static class TerrainImportPlanner
         }
 
         return fullPath;
+    }
+
+    private static string? ValidateWeightSource(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return null;
+        }
+
+        string fullPath = NormalizePath(path);
+        if (!string.Equals(Path.GetExtension(fullPath), ".ariweights", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException(
+                $"[TerrainImportPlanner] Weight source must use the explicit '.ariweights' extension: '{fullPath}'.");
+        }
+
+        if (!File.Exists(fullPath))
+        {
+            throw new FileNotFoundException(
+                "Terrain import weight source was not found.",
+                fullPath);
+        }
+
+        return fullPath;
+    }
+
+    private static TerrainWeightField? DecodeAuthoredWeights(
+        string? weightSourcePath,
+        TerrainHeightField heightField)
+    {
+        if (weightSourcePath == null)
+        {
+            return null;
+        }
+
+        TerrainWeightField weights = TerrainWeightSourceDecoder.DecodeFile(weightSourcePath);
+        if (weights.Width != heightField.Width || weights.Height != heightField.Height)
+        {
+            throw new InvalidDataException(
+                $"[TerrainImportPlanner] Weight source '{weightSourcePath}' is " +
+                $"{weights.Width}x{weights.Height} but the height source is " +
+                $"{heightField.Width}x{heightField.Height}.");
+        }
+
+        return weights;
     }
 
     private static string ValidateAssetName(string value)
