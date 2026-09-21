@@ -82,7 +82,6 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
 {
     private const int SoakCycleCount = 4;
     private const double PositionEpsilon = 0.0001;
-    private const float FarCameraRetreat = 48.0f;
 
     private readonly RuntimeSmokeScenarioContext m_Context;
     private readonly IRuntimeWorldStreamingService m_Streaming;
@@ -109,7 +108,14 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
     private WorldPosition m_BoundaryCameraPosition;
     private WorldPosition m_FarCameraPosition;
     private WorldPosition m_CurrentCameraPosition;
+    // Rotation authored on the scene camera. No captured checkpoint uses it: the fixture aims every
+    // pose it captures at the terrain bounds, because the authored showcase rotation leaves the
+    // canonical tile that sits behind the view direction fully culled. Only the rebase-source pose,
+    // which captures nothing, keeps the shipped view direction.
     private Quaternion m_CameraRotation;
+    private Quaternion m_NearRotation;
+    private Quaternion m_BoundaryRotation;
+    private Quaternion m_FarRotation;
     private Guid m_RootGuid;
     private int m_ExpectedTileCount;
     private int m_ExpectedLayerCount;
@@ -118,9 +124,11 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
     private string m_PendingCapture = string.Empty;
     private uint m_PendingCaptureFrame;
     private TerrainStreamingSmokeBounds? m_LoadedBounds;
+    private TerrainStreamingSmokeBounds? m_SoakBaseline;
     private TerrainStreamingDrainSnapshot m_LastDrainSnapshot;
     private TerrainStreamingSmokeStage m_Stage;
     private TerrainStreamingSmokeStage m_TerminalStage;
+    private bool m_DiscoveryAimed;
     private int m_SoakCyclesCompleted;
     private string? m_FailureMessage;
     private bool m_ReadyForShutdown;
@@ -277,6 +285,7 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         {
             message = "Unknown terrain-streaming smoke failure.";
         }
+        Time.Unpin();
 
         m_TerminalStage = m_Stage;
         m_FailureMessage ??= message;
@@ -287,6 +296,7 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
 
     public void AfterShutdown()
     {
+        Time.Unpin();
         m_Origin.RebaseStarting -= OnRebaseStarting;
         m_Origin.Rebased -= OnRebased;
         try
@@ -351,7 +361,31 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
     private void TryCompleteDiscovery(uint frameIndex)
     {
         TerrainDiagnosticsSnapshot snapshot = m_Diagnostics.GetSnapshot();
-        if (!IsTerrainReady(snapshot)) return;
+        // Discovery is a render-readiness gate: it rejects a root whose canonical tiles are not all
+        // selected and drawn. The authored rotation points the view along the valley, which culls
+        // the canonical tiles behind it, so the fixture moves to its own bounds-aimed near pose as
+        // soon as the cooked root bounds are known, and only then requires the complete render
+        // snapshot.
+        if (!m_DiscoveryAimed)
+        {
+            TerrainRootDiagnosticSnapshot[] candidateRoots = snapshot.Roots
+                .Where(root => root.WorldBounds.IsValid)
+                .ToArray();
+            if (candidateRoots.Length != 1)
+            {
+                return;
+            }
+
+            BuildCameraPath(candidateRoots[0].WorldBounds);
+            SetCamera(m_OriginalCameraPosition, m_NearRotation);
+            m_DiscoveryAimed = true;
+            return;
+        }
+
+        if (!IsTerrainReady(snapshot))
+        {
+            return;
+        }
 
         TerrainRootDiagnosticSnapshot[] roots = snapshot.Roots
             .Where(root => root.ResidentTileCount > 0)
@@ -367,7 +401,10 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         TerrainTileDiagnosticSnapshot[] tiles = snapshot.Tiles
             .Where(tile => tile.TerrainRootGuid == root.RootGuid)
             .ToArray();
-        if (!HasCompleteRenderSnapshot(snapshot, root, tiles)) return;
+        if (!HasCompleteRenderSnapshot(snapshot, root, tiles))
+        {
+            return;
+        }
 
         WorldCellId[] ownerCells = tiles
             .SelectMany(tile => tile.Owners)
@@ -396,9 +433,22 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         m_InitialRebaseSequence = m_Origin.RebaseSequence;
         BuildCameraPath(root.WorldBounds);
         m_Streaming.ClearStreamingSource();
-        SetCamera(m_OriginalCameraPosition);
+        SetCamera(m_OriginalCameraPosition, m_NearRotation);
+        PinStationaryAnimationClock();
         ScheduleCapture("near", checked(frameIndex + 1));
         m_Stage = TerrainStreamingSmokeStage.AwaitNearCapture;
+    }
+
+    /// <summary>
+    /// The rebase capture and the return-to-start capture both replay a camera that was already
+    /// captured and require a visually identical frame, so the animation clock is pinned across
+    /// the whole comparison window. Wind is time-driven and would otherwise advance between those
+    /// captures, which would leave a genuine rebase-stability failure indistinguishable from
+    /// expected animation progress.
+    /// </summary>
+    private static void PinStationaryAnimationClock()
+    {
+        Time.Pin(Time.elapsedTime);
     }
 
     internal static bool HasCompleteRenderSnapshot(
@@ -440,7 +490,7 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
 
     private void BeginBoundaryCapture(uint frameIndex)
     {
-        SetCamera(m_BoundaryCameraPosition);
+        SetCamera(m_BoundaryCameraPosition, m_BoundaryRotation);
         m_Streaming.SetStreamingSource(m_BoundaryCameraPosition);
         ScheduleCapture("boundary-mixed-lod", checked(frameIndex + 1));
         m_Stage = TerrainStreamingSmokeStage.AwaitBoundaryCapture;
@@ -448,7 +498,7 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
 
     private void BeginFarCapture(uint frameIndex)
     {
-        SetCamera(m_FarCameraPosition);
+        SetCamera(m_FarCameraPosition, m_FarRotation);
         m_Streaming.SetStreamingSource(m_FarCameraPosition);
         ScheduleCapture("far-cascade", checked(frameIndex + 1));
         m_Stage = TerrainStreamingSmokeStage.AwaitFarCapture;
@@ -456,7 +506,7 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
 
     private void BeginOriginRebase()
     {
-        SetCamera(m_RebaseSource);
+        SetCamera(m_RebaseSource, m_CameraRotation);
         m_Streaming.SetStreamingSource(m_RebaseSource);
         m_Stage = TerrainStreamingSmokeStage.AwaitOriginRebase;
     }
@@ -472,20 +522,21 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         }
 
         m_Streaming.ClearStreamingSource();
-        SetCamera(m_BoundaryCameraPosition);
+        SetCamera(m_BoundaryCameraPosition, m_BoundaryRotation);
         ScheduleCapture("post-rebase", checked(frameIndex + 1));
         m_Stage = TerrainStreamingSmokeStage.AwaitPostRebaseCapture;
     }
 
     private void BeginReturnedCapture(uint frameIndex)
     {
-        SetCamera(m_OriginalCameraPosition);
+        SetCamera(m_OriginalCameraPosition, m_NearRotation);
         ScheduleCapture("returned-start", checked(frameIndex + 1));
         m_Stage = TerrainStreamingSmokeStage.AwaitReturnedCapture;
     }
 
     private void BeginInitialUnload()
     {
+        Time.Unpin();
         m_Streaming.ClearStreamingSource();
         if (m_TerrainCell == null || !m_Streaming.UnpinCell(m_TerrainCell.Id))
         {
@@ -504,6 +555,10 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             return;
         }
 
+        // The reload soak verifies that repeated load/unload cycles return to the loaded steady
+        // state the camera path reached. The baseline is frozen here, on the first cycle, so every
+        // later cycle is compared against the same loaded world at the same camera pose.
+        m_SoakBaseline ??= m_LoadedBounds;
         m_Stage = TerrainStreamingSmokeStage.AwaitSoakLoad;
     }
 
@@ -648,8 +703,8 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         if (!valid)
         {
             ReportFailure(
-                $"Terrain checkpoint '{name}' found invalid residency, LOD, patch bounds, " +
-                "ECS ownership, query parity, or seam state.");
+                $"Terrain checkpoint '{name}' found a tile with no selected patch, invalid " +
+                "residency, LOD, patch bounds, ECS ownership, query parity, or seam state.");
             return checkpoint;
         }
 
@@ -663,6 +718,7 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             !tile.IsVisible ||
             tile.IsFailed ||
             tile.SeamViolationCount != 0 ||
+            tile.Patches.Count == 0 ||
             !tile.WorldBounds.IsValid ||
             !tile.Owners.Any(owner =>
                 owner.Kind == RuntimeAssetResidencyOwnerKind.WorldCell &&
@@ -776,24 +832,47 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             memory.TerrainPreparedBytes,
             memory.TerrainLayerDescriptors,
             memory.SelectedPatches);
-        if (m_LoadedBounds == null)
+        if (m_SoakBaseline == null)
         {
-            m_LoadedBounds = current;
+            // Every named checkpoint frames a different amount of the world, so the loaded steady
+            // state the soak compares against is the running high-water mark of the camera path.
+            // Comparing a later pose against the first checkpoint would report the camera path's
+            // own visibility changes as reload growth.
+            m_LoadedBounds = m_LoadedBounds == null
+                ? current
+                : HighWaterMark(m_LoadedBounds, current);
             return;
         }
 
-        if (current.AllocatedEntitySlots > m_LoadedBounds.AllocatedEntitySlots ||
-            current.LoadedCookedHandles > m_LoadedBounds.LoadedCookedHandles ||
-            current.ResidentAssets > m_LoadedBounds.ResidentAssets ||
-            current.PreparedDescriptors > m_LoadedBounds.PreparedDescriptors ||
-            current.TerrainCpuBytes > m_LoadedBounds.TerrainCpuBytes ||
-            current.TerrainPreparedBytes > m_LoadedBounds.TerrainPreparedBytes ||
-            current.TerrainLayerDescriptors > m_LoadedBounds.TerrainLayerDescriptors ||
+        if (ExceedsLoadedBounds(current, m_SoakBaseline) ||
             current.SelectedPatches > TerrainLodSettings.Default.MaximumPatchCount)
         {
             ReportFailure("Terrain reload soak exceeded its first loaded steady-state bounds.");
         }
     }
+
+    private static TerrainStreamingSmokeBounds HighWaterMark(
+        TerrainStreamingSmokeBounds baseline,
+        TerrainStreamingSmokeBounds current) => new(
+        Math.Max(baseline.AllocatedEntitySlots, current.AllocatedEntitySlots),
+        Math.Max(baseline.LoadedCookedHandles, current.LoadedCookedHandles),
+        Math.Max(baseline.ResidentAssets, current.ResidentAssets),
+        Math.Max(baseline.PreparedDescriptors, current.PreparedDescriptors),
+        Math.Max(baseline.TerrainCpuBytes, current.TerrainCpuBytes),
+        Math.Max(baseline.TerrainPreparedBytes, current.TerrainPreparedBytes),
+        Math.Max(baseline.TerrainLayerDescriptors, current.TerrainLayerDescriptors),
+        Math.Max(baseline.SelectedPatches, current.SelectedPatches));
+
+    private static bool ExceedsLoadedBounds(
+        TerrainStreamingSmokeBounds current,
+        TerrainStreamingSmokeBounds baseline) =>
+        current.AllocatedEntitySlots > baseline.AllocatedEntitySlots ||
+        current.LoadedCookedHandles > baseline.LoadedCookedHandles ||
+        current.ResidentAssets > baseline.ResidentAssets ||
+        current.PreparedDescriptors > baseline.PreparedDescriptors ||
+        current.TerrainCpuBytes > baseline.TerrainCpuBytes ||
+        current.TerrainPreparedBytes > baseline.TerrainPreparedBytes ||
+        current.TerrainLayerDescriptors > baseline.TerrainLayerDescriptors;
 
     private void ValidateHardBudgets()
     {
@@ -982,26 +1061,32 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
 
     private void BuildCameraPath(TerrainPatchWorldBounds rootBounds)
     {
-        double centerX = (rootBounds.Min.X + rootBounds.Max.X) * 0.5;
-        m_BoundaryCameraPosition = new WorldPosition(
-            centerX,
-            m_OriginalCameraPosition.Y,
-            m_OriginalCameraPosition.Z);
-        Vector3 forward = Vector3.Transform(Vector3.UnitZ, m_CameraRotation);
-        float lengthSquared = forward.LengthSquared();
-        if (!float.IsFinite(lengthSquared) || lengthSquared <= 0.000001f)
-        {
-            throw new InvalidOperationException("Terrain-streaming camera direction is invalid.");
-        }
-
-        forward /= MathF.Sqrt(lengthSquared);
-        m_FarCameraPosition = new WorldPosition(
-            m_OriginalCameraPosition.X - forward.X * FarCameraRetreat,
-            m_OriginalCameraPosition.Y - forward.Y * FarCameraRetreat,
-            m_OriginalCameraPosition.Z - forward.Z * FarCameraRetreat);
+        TerrainStreamingCameraPoses poses = TerrainStreamingCameraPath.Build(
+            rootBounds,
+            m_OriginalCameraPosition,
+            SampleSurfaceHeight);
+        m_NearRotation = poses.NearRotation;
+        m_BoundaryCameraPosition = poses.BoundaryPosition;
+        m_BoundaryRotation = poses.BoundaryRotation;
+        m_FarCameraPosition = poses.FarPosition;
+        m_FarRotation = poses.FarRotation;
     }
 
-    private void SetCamera(WorldPosition worldPosition)
+    /// <summary>
+    /// Terrain surface height the fixture's own poses stand on. The runtime query answers only while
+    /// the canonical tiles are active, so the discovery pose falls back to the bounds maximum; the
+    /// fixture rebuilds its path once the complete render snapshot exists and the query is live.
+    /// </summary>
+    private double SampleSurfaceHeight(double worldX, double worldZ)
+    {
+        WorldPosition position = new(worldX, m_OriginalCameraPosition.Y, worldZ);
+        TerrainQueryResult result = m_Query.Query(position);
+        return result.Status == TerrainQueryStatus.Available && result.SurfacePosition.IsFinite
+            ? result.SurfacePosition.Y
+            : double.NaN;
+    }
+
+    private void SetCamera(WorldPosition worldPosition, in Quaternion rotation)
     {
         if (!m_EntityManager!.IsAlive(m_CameraEntity) ||
             !m_EntityManager.HasComponent<TransformComponent>(m_CameraEntity) ||
@@ -1014,7 +1099,7 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         ref TransformComponent transform = ref m_EntityManager.GetComponent<TransformComponent>(
             m_CameraEntity);
         transform.Position = relative;
-        transform.Rotation = m_CameraRotation;
+        transform.Rotation = rotation;
         m_CurrentCameraPosition = worldPosition;
     }
 
