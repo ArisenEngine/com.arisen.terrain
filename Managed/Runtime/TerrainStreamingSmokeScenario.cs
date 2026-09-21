@@ -105,14 +105,10 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
     private WorldPosition m_RebaseSource;
     private Entity m_CameraEntity;
     private WorldPosition m_OriginalCameraPosition;
+    private WorldPosition m_NearCameraPosition;
     private WorldPosition m_BoundaryCameraPosition;
     private WorldPosition m_FarCameraPosition;
     private WorldPosition m_CurrentCameraPosition;
-    // Rotation authored on the scene camera. No captured checkpoint uses it: the fixture aims every
-    // pose it captures at the terrain bounds, because the authored showcase rotation leaves the
-    // canonical tile that sits behind the view direction fully culled. Only the rebase-source pose,
-    // which captures nothing, keeps the shipped view direction.
-    private Quaternion m_CameraRotation;
     private Quaternion m_NearRotation;
     private Quaternion m_BoundaryRotation;
     private Quaternion m_FarRotation;
@@ -377,7 +373,7 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             }
 
             BuildCameraPath(candidateRoots[0].WorldBounds);
-            SetCamera(m_OriginalCameraPosition, m_NearRotation);
+            SetCamera(m_NearCameraPosition, m_NearRotation);
             m_DiscoveryAimed = true;
             return;
         }
@@ -433,18 +429,18 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         m_InitialRebaseSequence = m_Origin.RebaseSequence;
         BuildCameraPath(root.WorldBounds);
         m_Streaming.ClearStreamingSource();
-        SetCamera(m_OriginalCameraPosition, m_NearRotation);
+        SetCamera(m_NearCameraPosition, m_NearRotation);
         PinStationaryAnimationClock();
         ScheduleCapture("near", checked(frameIndex + 1));
         m_Stage = TerrainStreamingSmokeStage.AwaitNearCapture;
     }
 
     /// <summary>
-    /// The rebase capture and the return-to-start capture both replay a camera that was already
-    /// captured and require a visually identical frame, so the animation clock is pinned across
-    /// the whole comparison window. Wind is time-driven and would otherwise advance between those
-    /// captures, which would leave a genuine rebase-stability failure indistinguishable from
-    /// expected animation progress.
+    /// The post-rebase capture replays the parked far capture and the return-to-start capture
+    /// replays the near capture, and both pairs require a visually identical frame, so the
+    /// animation clock is pinned across the whole comparison window. Wind is time-driven and would
+    /// otherwise advance between those captures, which would leave a genuine rebase-stability
+    /// failure indistinguishable from expected animation progress.
     /// </summary>
     private static void PinStationaryAnimationClock()
     {
@@ -504,13 +500,27 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         m_Stage = TerrainStreamingSmokeStage.AwaitFarCapture;
     }
 
+    /// <summary>
+    /// Rebases the world under the camera that was captured last. The camera stays parked on the far
+    /// pose: the streaming source alone decides when <see cref="IWorldOriginService"/> rebases, so
+    /// moving the source across the rebase threshold is enough to trigger one, and leaving the camera
+    /// where it was is what makes the post-rebase capture comparable to the far capture. A capture
+    /// pair that also replayed a camera path would fold the origin change, the terrain residency
+    /// churn and the LOD history of that path into the same frame difference, and the fixture could
+    /// not tell a rebase regression from the expected change of a mixed-LOD plan.
+    /// </summary>
     private void BeginOriginRebase()
     {
-        SetCamera(m_RebaseSource, m_CameraRotation);
         m_Streaming.SetStreamingSource(m_RebaseSource);
         m_Stage = TerrainStreamingSmokeStage.AwaitOriginRebase;
     }
 
+    /// <summary>
+    /// Waits for the sourced rebase and captures the parked far pose again. The frame is not
+    /// re-staged through <c>SetCamera</c>: the origin service has just shifted every origin-relative
+    /// transform, the camera included, so the capture only matches the pre-rebase far capture while
+    /// the rebase preserved the parked view.
+    /// </summary>
     private void ObserveOriginRebase(uint frameIndex)
     {
         long expectedSequence = checked(m_InitialRebaseSequence + 1);
@@ -522,14 +532,13 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         }
 
         m_Streaming.ClearStreamingSource();
-        SetCamera(m_BoundaryCameraPosition, m_BoundaryRotation);
         ScheduleCapture("post-rebase", checked(frameIndex + 1));
         m_Stage = TerrainStreamingSmokeStage.AwaitPostRebaseCapture;
     }
 
     private void BeginReturnedCapture(uint frameIndex)
     {
-        SetCamera(m_OriginalCameraPosition, m_NearRotation);
+        SetCamera(m_NearCameraPosition, m_NearRotation);
         ScheduleCapture("returned-start", checked(frameIndex + 1));
         m_Stage = TerrainStreamingSmokeStage.AwaitReturnedCapture;
     }
@@ -1049,7 +1058,6 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             m_CameraEntity = entity;
             m_OriginalCameraPosition = m_Origin.ToWorld(transform.Position);
             m_CurrentCameraPosition = m_OriginalCameraPosition;
-            m_CameraRotation = transform.Rotation;
         }
 
         if (!found)
@@ -1065,6 +1073,7 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             rootBounds,
             m_OriginalCameraPosition,
             SampleSurfaceHeight);
+        m_NearCameraPosition = poses.NearPosition;
         m_NearRotation = poses.NearRotation;
         m_BoundaryCameraPosition = poses.BoundaryPosition;
         m_BoundaryRotation = poses.BoundaryRotation;

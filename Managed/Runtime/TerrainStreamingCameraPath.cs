@@ -7,6 +7,7 @@ namespace ArisenEngine.Terrain;
 /// Camera poses the terrain-streaming smoke fixture derives from the loaded terrain bounds.
 /// </summary>
 internal readonly record struct TerrainStreamingCameraPoses(
+    WorldPosition NearPosition,
     Quaternion NearRotation,
     WorldPosition BoundaryPosition,
     Quaternion BoundaryRotation,
@@ -24,37 +25,42 @@ internal delegate double TerrainSurfaceHeightSampler(double worldX, double world
 ///
 /// Every checkpoint the fixture captures has to satisfy three independent contracts at once. The
 /// checkpoint capture rejects a tile that reports no selected patch, so the frustum has to reach
-/// all four canonical tiles; the visual capture rejects a frame that writes no depth, so the frame
-/// has to contain the terrain surface rather than only sky; and the summary validator rejects an
-/// inverted frame whose ground sits above the horizon in the image, so the surface has to stay
+/// every canonical tile of the root; the visual capture rejects a frame that writes no depth, so the
+/// frame has to contain the terrain surface rather than only sky; and the summary validator rejects
+/// an inverted frame whose ground sits above the horizon in the image, so the surface has to stay
 /// under a view that keeps the sky on top.
 ///
-/// Authored content cannot satisfy those contracts outside the exact pose the scene author framed.
-/// The authored rotation culls the tile behind the view direction, and the authored height is only
-/// above the surface at the authored position: a derived pose that inherits it walks into the
-/// hillside, captures the inside of the terrain through back-face culling, and reads back a frame
-/// whose lower part is missing depth.
+/// The coverage contract is a constraint on where a captured pose can stand once the root grows
+/// past a single view. The frustum spans roughly 73 degrees horizontally at the fixture's 45 degree
+/// vertical field of view and 16:9 aspect, while the canonical ShowcaseValley root covers a 512 m
+/// square: a pose anywhere inside that square has the raster all around it, so the tiles behind and
+/// beside the view direction fall outside the frustum and select no patch at all. Only the root's
+/// corner regions put the whole raster ahead of the camera, because the square occupies a single
+/// quadrant seen from a corner and the frustum wedge still reaches the opposite corner's tiles.
+/// Every captured pose therefore stands <see cref="CornerInsetFraction"/> inside one of the four
+/// corners of the root.
 ///
-/// The fixture therefore derives its own poses from the loaded terrain bounds and the runtime
-/// surface query. Every derived pose stands <see cref="EyeClearanceMetres"/> above the terrain
-/// surface at its own horizontal position, and every pose aims at the bounds centre with the
-/// elevation clamped into a shallow downward band, which keeps the sky above the ridge line and
-/// the streaming surface under the view in the same frame.
+/// The authored showcase camera remains the scene's own starting view, and the fixture cannot
+/// inherit it: it stands inside the raster, where no aim can frame the whole root. The fixture keeps
+/// the authored *bearing* instead: the near pose takes the corner nearest the authored position, so
+/// the valley is still viewed along the axis the scene author framed. Every derived pose stands
+/// <see cref="EyeClearanceMetres"/> above the terrain surface at its own horizontal position -
+/// inheriting the authored height would walk a pose that moves across the raster into the hillside,
+/// capture the inside of the terrain through back-face culling, and read back a frame whose lower
+/// part holds no written depth - and every derived pose aims at the bounds centre with the elevation
+/// clamped into a shallow downward band, which keeps the sky over the ridge line and the streaming
+/// surface under the view in the same frame.
 /// </summary>
 internal static class TerrainStreamingCameraPath
 {
-    /// <summary>Distance the far checkpoint retreats from the authored camera position.</summary>
-    public const float FarRetreat = 48.0f;
-
     /// <summary>
-    /// Fraction of the terrain's X extent that the boundary checkpoint stands inside the terrain,
-    /// measured from the eastern edge along the shared tile boundary in Z. The pose cannot stand on
-    /// the four-tile corner: the aim direction to the bounds centre is horizontal there, which is
-    /// degenerate. Standing on a tile boundary inside the terrain keeps both neighbouring tiles
-    /// equally close, which is the mixed-LOD view the checkpoint exists for, and the eastern half of
-    /// the boundary line keeps the pose on the valley floor where the surface stays under the view.
+    /// Fraction of the terrain extent a captured pose stands inside the root bounds, measured from
+    /// the corner it is anchored to along both axes. The pose has to stand inside the raster so the
+    /// runtime surface query answers for its own horizontal position and the eye height stays a few
+    /// metres above the ground. The inset stays small because a pose that walks away from its corner
+    /// widens the angle the raster subtends, and the frustum wedge has to keep covering it.
     /// </summary>
-    public const float BoundaryInsetFraction = 0.25f;
+    public const float CornerInsetFraction = 0.02f;
 
     /// <summary>
     /// Height of every derived fixture camera above the terrain surface at its own horizontal
@@ -95,27 +101,60 @@ internal static class TerrainStreamingCameraPath
                 "Terrain-streaming camera path requires a finite authored camera position.");
         }
 
-        WorldPosition target = Center(rootBounds);
-        Quaternion nearRotation = Aim(rootBounds, authoredPosition);
-        double inset = (rootBounds.Max.X - rootBounds.Min.X) * BoundaryInsetFraction;
-        double boundaryX = rootBounds.Max.X - inset;
-        var boundaryPosition = new WorldPosition(
-            boundaryX,
-            EyeHeight(rootBounds, surfaceHeight, boundaryX, target.Z),
-            target.Z);
-        Vector3 forward = HorizontalForward(nearRotation);
-        double farX = authoredPosition.X - (forward.X * FarRetreat);
-        double farZ = authoredPosition.Z - (forward.Z * FarRetreat);
-        var farPosition = new WorldPosition(
-            farX,
-            EyeHeight(rootBounds, surfaceHeight, farX, farZ),
-            farZ);
+        WorldPosition[] corners = CornerPoses(rootBounds, authoredPosition, surfaceHeight);
         return new TerrainStreamingCameraPoses(
-            nearRotation,
-            boundaryPosition,
-            Aim(rootBounds, boundaryPosition),
-            farPosition,
-            Aim(rootBounds, farPosition));
+            corners[0],
+            Aim(rootBounds, corners[0]),
+            corners[1],
+            Aim(rootBounds, corners[1]),
+            corners[^1],
+            Aim(rootBounds, corners[^1]));
+    }
+
+    /// <summary>
+    /// The four corner regions of the terrain root, ordered by their distance to the authored camera
+    /// position so every fixture pose stays deterministic: the closest corner is the near pose, the
+    /// next one the boundary pose, and the farthest the far pose. Every one of them frames the whole
+    /// root, and the three captures that use them are three different views of it.
+    /// </summary>
+    private static WorldPosition[] CornerPoses(
+        in TerrainPatchWorldBounds rootBounds,
+        WorldPosition authoredPosition,
+        TerrainSurfaceHeightSampler? surfaceHeight)
+    {
+        double insetX = (rootBounds.Max.X - rootBounds.Min.X) * CornerInsetFraction;
+        double insetZ = (rootBounds.Max.Z - rootBounds.Min.Z) * CornerInsetFraction;
+        double[] positionsX = [rootBounds.Min.X + insetX, rootBounds.Max.X - insetX];
+        double[] positionsZ = [rootBounds.Min.Z + insetZ, rootBounds.Max.Z - insetZ];
+        var corners = new WorldPosition[positionsX.Length * positionsZ.Length];
+        int count = 0;
+        for (int x = 0; x < positionsX.Length; x++)
+        {
+            for (int z = 0; z < positionsZ.Length; z++)
+            {
+                corners[count++] = new WorldPosition(
+                    positionsX[x],
+                    EyeHeight(rootBounds, surfaceHeight, positionsX[x], positionsZ[z]),
+                    positionsZ[z]);
+            }
+        }
+
+        return corners
+            .OrderBy(corner => DistanceSquared(corner, authoredPosition))
+            .ToArray();
+    }
+
+    /// <summary>
+    /// Squared distance between two world positions. Comparing squared distances keeps the corner
+    /// order away from a square root, which would only add rounding to a decision that has to stay
+    /// deterministic frame to frame.
+    /// </summary>
+    private static double DistanceSquared(WorldPosition left, WorldPosition right)
+    {
+        double deltaX = left.X - right.X;
+        double deltaY = left.Y - right.Y;
+        double deltaZ = left.Z - right.Z;
+        return (deltaX * deltaX) + (deltaY * deltaY) + (deltaZ * deltaZ);
     }
 
     /// <summary>
@@ -206,19 +245,6 @@ internal static class TerrainStreamingCameraPath
 
     public static Vector3 Forward(in Quaternion rotation) =>
         Vector3.Transform(Vector3.UnitZ, rotation);
-
-    /// <summary>
-    /// View forward projected onto the terrain plane and normalized, so a derived pose retreats
-    /// across the surface instead of walking down the view direction into the hillside.
-    /// </summary>
-    public static Vector3 HorizontalForward(in Quaternion rotation)
-    {
-        Vector3 forward = Forward(rotation);
-        var horizontal = new Vector3(forward.X, 0.0f, forward.Z);
-        return horizontal.LengthSquared() > 1.0e-6f
-            ? Vector3.Normalize(horizontal)
-            : Vector3.UnitZ;
-    }
 
     public static float ElevationDegrees(in Quaternion rotation) =>
         MathF.Asin(Math.Clamp(Forward(rotation).Y, -1.0f, 1.0f)) * (180.0f / MathF.PI);
