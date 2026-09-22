@@ -45,6 +45,56 @@ public readonly record struct TerrainLodView(
         float.IsFinite(matrix.M33) && float.IsFinite(matrix.M34) &&
         float.IsFinite(matrix.M41) && float.IsFinite(matrix.M42) &&
         float.IsFinite(matrix.M43) && float.IsFinite(matrix.M44);
+
+    /// <summary>
+    /// Whether the frustum this view carries can see the supplied world bounds. The question is
+    /// answered with the same six-plane predicate the planner culls patches with, at whatever
+    /// granularity the caller supplies: the planner asks it of one patch, and a consumer that only
+    /// has a whole tile's bounds asks it of that tile. An invalid view sees nothing, so a caller
+    /// that never received a plan cannot mistake the default value for an all-seeing frustum.
+    /// </summary>
+    public bool IsFrustumVisible(in TerrainPatchWorldBounds worldBounds) =>
+        IsValid &&
+        worldBounds.IsValid &&
+        TryToOriginRelative(worldBounds, RenderOrigin, out Vector3 minimum, out Vector3 maximum) &&
+        TerrainPatchFrustum.IsVisible(minimum, maximum, OriginRelativeViewProjection);
+
+    /// <summary>
+    /// Origin-relative float bounds of a world-space box, or false when the box cannot be
+    /// represented at the supplied render origin.
+    /// </summary>
+    internal static bool TryToOriginRelative(
+        in TerrainPatchWorldBounds bounds,
+        in WorldPosition renderOrigin,
+        out Vector3 minimum,
+        out Vector3 maximum)
+    {
+        minimum = default;
+        maximum = default;
+        return TryToFloat(bounds.Min, renderOrigin, out minimum) &&
+               TryToFloat(bounds.Max, renderOrigin, out maximum);
+    }
+
+    private static bool TryToFloat(
+        in WorldPosition world,
+        in WorldPosition origin,
+        out Vector3 value)
+    {
+        double x = world.X - origin.X;
+        double y = world.Y - origin.Y;
+        double z = world.Z - origin.Z;
+        if (!double.IsFinite(x) || !double.IsFinite(y) || !double.IsFinite(z) ||
+            Math.Abs(x) > float.MaxValue ||
+            Math.Abs(y) > float.MaxValue ||
+            Math.Abs(z) > float.MaxValue)
+        {
+            value = default;
+            return false;
+        }
+
+        value = new Vector3((float)x, (float)y, (float)z);
+        return true;
+    }
 }
 
 public readonly record struct TerrainLodSettings(
@@ -267,7 +317,7 @@ internal sealed class TerrainLodPlanner : ITerrainLodPlanner
                 ref readonly TerrainPatchAcceleration patch =
                     ref acceleration.GetPatch(patchIndex);
                 TerrainPatchWorldBounds worldBounds = CreateWorldBounds(resident.Tile, patch);
-                if (!TryToOriginRelative(
+                if (!TerrainLodView.TryToOriginRelative(
                         worldBounds,
                         view.RenderOrigin,
                         out Vector3 relativeMin,
@@ -726,39 +776,6 @@ internal sealed class TerrainLodPlanner : ITerrainLodPlanner
         }
 
         return bounds;
-    }
-
-    private static bool TryToOriginRelative(
-        in TerrainPatchWorldBounds bounds,
-        in WorldPosition renderOrigin,
-        out Vector3 minimum,
-        out Vector3 maximum)
-    {
-        minimum = default;
-        maximum = default;
-        return TryToFloat(bounds.Min, renderOrigin, out minimum) &&
-               TryToFloat(bounds.Max, renderOrigin, out maximum);
-    }
-
-    private static bool TryToFloat(
-        in WorldPosition world,
-        in WorldPosition origin,
-        out Vector3 value)
-    {
-        double x = world.X - origin.X;
-        double y = world.Y - origin.Y;
-        double z = world.Z - origin.Z;
-        if (!double.IsFinite(x) || !double.IsFinite(y) || !double.IsFinite(z) ||
-            Math.Abs(x) > float.MaxValue ||
-            Math.Abs(y) > float.MaxValue ||
-            Math.Abs(z) > float.MaxValue)
-        {
-            value = default;
-            return false;
-        }
-
-        value = new Vector3((float)x, (float)y, (float)z);
-        return true;
     }
 
     private static double DistanceSquared(

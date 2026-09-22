@@ -140,6 +140,7 @@ public sealed record TerrainDiagnosticsSnapshot(
     uint FrameIndex,
     TerrainResidencyMetrics Residency,
     TerrainLodMetrics Lod,
+    TerrainLodView PlanView,
     WorldPosition QueryPosition,
     TerrainQueryResult Query,
     IReadOnlyList<TerrainRootDiagnosticSnapshot> Roots,
@@ -153,6 +154,7 @@ public sealed record TerrainDiagnosticsSnapshot(
     public static TerrainDiagnosticsSnapshot Empty { get; } = new(
         0,
         new TerrainResidencyMetrics(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0),
+        default,
         default,
         default,
         default,
