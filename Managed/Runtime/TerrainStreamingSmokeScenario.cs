@@ -82,6 +82,7 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
 {
     private const int SoakCycleCount = 4;
     private const double PositionEpsilon = 0.0001;
+    private const double RebasePositionTolerance = 0.01;
 
     private readonly RuntimeSmokeScenarioContext m_Context;
     private readonly IRuntimeWorldStreamingService m_Streaming;
@@ -101,6 +102,12 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
     private WorldDescriptor? m_World;
     private EntityManager? m_EntityManager;
     private TerrainStreamingOwnerCells? m_OwnerCells;
+    private TerrainStreamingOwnerCells? m_ParkedCells;
+    private readonly HashSet<Guid> m_CoreTiles = new();
+    private HashSet<Guid> m_ExpectedTiles = new();
+    private bool m_PlanDriven;
+    private long m_LastRebaseSequence;
+    private long m_RebaseSequenceBeforeStep;
     private WorldPosition m_DiscoverySource;
     private WorldPosition m_RebaseSource;
     private Entity m_CameraEntity;
@@ -115,9 +122,8 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
     private Quaternion m_MirrorRotation;
     private Quaternion m_FarRotation;
     private Guid m_RootGuid;
-    private int m_ExpectedTileCount;
+    private int m_RootTileCount;
     private int m_ExpectedLayerCount;
-    private long m_InitialRebaseSequence;
     private readonly Dictionary<WorldCellId, long> m_SoakReloadGenerations = new();
     private readonly Dictionary<WorldCellId, long> m_SoakCurrentGenerations = new();
     private readonly HashSet<Guid> m_CoveredTiles = new();
@@ -190,12 +196,17 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
 
         m_World = world;
         m_EntityManager = entityManager;
+        // The authored camera is captured first. The fixture derives both its poses and its streaming
+        // source from where the scene's own camera stands, so the discovery pose is the corner of the
+        // root the authored view already framed, and the owner cells it pins are the ones streaming a
+        // player standing there would have resident.
+        CaptureCamera();
         SelectPath(m_World);
         ConfigureValidationBudgets(m_World);
-        CaptureCamera();
+        m_LastRebaseSequence = m_Origin.RebaseSequence;
         m_Origin.RebaseStarting += OnRebaseStarting;
         m_Origin.Rebased += OnRebased;
-        m_Streaming.SetStreamingSource(m_DiscoverySource);
+        SetStreamingSource(m_DiscoverySource);
         m_Stage = TerrainStreamingSmokeStage.AwaitDiscovery;
         return true;
     }
@@ -218,30 +229,61 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         ValidateHardBudgets();
         if (m_FailureMessage != null) return;
 
+        VerifyRebaseInvariant();
+        if (m_FailureMessage != null) return;
+
         switch (m_Stage)
         {
             case TerrainStreamingSmokeStage.AwaitDiscovery:
-                TryCompleteDiscovery(frameIndex);
+                TryCompleteDiscovery();
+                break;
+            case TerrainStreamingSmokeStage.AwaitNearSettle:
+                if (ResidencySettled(exact: true))
+                {
+                    ScheduleCapture("near", checked(frameIndex + 1));
+                    m_Stage = TerrainStreamingSmokeStage.AwaitNearCapture;
+                }
                 break;
             case TerrainStreamingSmokeStage.AwaitNearCapture:
                 if (CaptureCompleted("near", frameIndex))
                 {
                     CaptureCheckpoint("near", frameIndex);
-                    BeginBoundaryCapture(frameIndex);
+                    BeginBoundaryCapture();
+                }
+                break;
+            case TerrainStreamingSmokeStage.AwaitBoundarySettle:
+                if (ResidencySettled(exact: false))
+                {
+                    ScheduleCapture("boundary-mixed-lod", checked(frameIndex + 1));
+                    m_Stage = TerrainStreamingSmokeStage.AwaitBoundaryCapture;
                 }
                 break;
             case TerrainStreamingSmokeStage.AwaitBoundaryCapture:
                 if (CaptureCompleted("boundary-mixed-lod", frameIndex))
                 {
                     CaptureCheckpoint("boundary-mixed-lod", frameIndex);
-                    BeginMirrorCapture(frameIndex);
+                    BeginMirrorCapture();
+                }
+                break;
+            case TerrainStreamingSmokeStage.AwaitMirrorSettle:
+                if (ResidencySettled(exact: false))
+                {
+                    ScheduleCapture("mirror-cascade", checked(frameIndex + 1));
+                    m_Stage = TerrainStreamingSmokeStage.AwaitMirrorCapture;
                 }
                 break;
             case TerrainStreamingSmokeStage.AwaitMirrorCapture:
                 if (CaptureCompleted("mirror-cascade", frameIndex))
                 {
                     CaptureCheckpoint("mirror-cascade", frameIndex);
-                    BeginFarCapture(frameIndex);
+                    BeginFarCapture();
+                }
+                break;
+            case TerrainStreamingSmokeStage.AwaitFarSettle:
+                if (ResidencySettled(exact: false))
+                {
+                    ScheduleCapture("far-cascade", checked(frameIndex + 1));
+                    m_Stage = TerrainStreamingSmokeStage.AwaitFarCapture;
                 }
                 break;
             case TerrainStreamingSmokeStage.AwaitFarCapture:
@@ -252,13 +294,27 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
                 }
                 break;
             case TerrainStreamingSmokeStage.AwaitOriginRebase:
-                ObserveOriginRebase(frameIndex);
+                ObserveOriginRebase();
+                break;
+            case TerrainStreamingSmokeStage.AwaitPostRebaseSettle:
+                if (ResidencySettled(exact: true))
+                {
+                    ScheduleCapture("post-rebase", checked(frameIndex + 1));
+                    m_Stage = TerrainStreamingSmokeStage.AwaitPostRebaseCapture;
+                }
                 break;
             case TerrainStreamingSmokeStage.AwaitPostRebaseCapture:
                 if (CaptureCompleted("post-rebase", frameIndex))
                 {
                     CaptureCheckpoint("post-rebase", frameIndex);
-                    BeginReturnedCapture(frameIndex);
+                    BeginReturnedCapture();
+                }
+                break;
+            case TerrainStreamingSmokeStage.AwaitReturnedSettle:
+                if (ResidencySettled(exact: true))
+                {
+                    ScheduleCapture("returned-start", checked(frameIndex + 1));
+                    m_Stage = TerrainStreamingSmokeStage.AwaitReturnedCapture;
                 }
                 break;
             case TerrainStreamingSmokeStage.AwaitReturnedCapture:
@@ -340,12 +396,10 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
                     $"expected {SoakCycleCount}.";
             }
 
-            if (m_RebaseStarts.Count != 1 ||
-                m_RebaseCompletions.Count != 1 ||
-                m_RebaseStarts[0] != m_RebaseCompletions[0])
+            if (!RebasesAreBalanced())
             {
                 m_FailureMessage ??=
-                    "Terrain camera path did not complete exactly one balanced origin rebase.";
+                    "Terrain camera path observed an unbalanced origin rebase.";
             }
 
             RuntimeVisualSummaryCaptureResult[] captures =
@@ -367,14 +421,15 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         WriteArtifact();
     }
 
-    private void TryCompleteDiscovery(uint frameIndex)
+    private void TryCompleteDiscovery()
     {
         TerrainDiagnosticsSnapshot snapshot = m_Diagnostics.GetSnapshot();
-        // Discovery is a render-readiness gate: it rejects a root whose canonical tiles are not all
-        // selected and drawn. The authored rotation points the view along the valley, which culls
-        // the canonical tiles behind it, so the fixture moves to its own bounds-aimed near pose as
-        // soon as the cooked root bounds are known, and only then requires the complete render
-        // snapshot.
+        // Discovery is a render-readiness gate: it rejects a root whose resident canonical tiles are
+        // not all selected and drawn. The authored rotation points the view along the valley, which
+        // culls the canonical tiles behind it, so the fixture moves to its own bounds-aimed near pose
+        // as soon as the cooked root bounds are known, and only then requires the complete render
+        // snapshot. A root whose tiles are split across world cells is only partly resident at its
+        // discovery pose, so the gate follows the held tiles and the plan publishes.
         if (!m_DiscoveryAimed)
         {
             TerrainRootDiagnosticSnapshot[] candidateRoots = snapshot.Roots
@@ -391,7 +446,7 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             return;
         }
 
-        if (!IsTerrainReady(snapshot))
+        if (!IsTerrainReady(snapshot) || !ResidencySettled(exact: false))
         {
             return;
         }
@@ -407,39 +462,38 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         }
 
         TerrainRootDiagnosticSnapshot root = roots[0];
-        TerrainTileDiagnosticSnapshot[] tiles = snapshot.Tiles
-            .Where(tile => tile.TerrainRootGuid == root.RootGuid)
-            .ToArray();
+        TerrainTileDiagnosticSnapshot[] tiles = ResidentTiles(snapshot, root.RootGuid);
         if (!HasCompleteRenderSnapshot(snapshot, root, tiles))
         {
             return;
         }
 
-        m_OwnerCells = TerrainStreamingOwnerCells.TryCreate(
+        TerrainStreamingOwnerCells? ownerCells = TerrainStreamingOwnerCells.TryCreate(
             m_World!,
             tiles,
             out string ownerDiagnostic);
-        if (m_OwnerCells == null)
+        if (ownerCells == null)
         {
             ReportFailure(ownerDiagnostic);
             return;
         }
 
-        if (!TryPinOwnerCells("while discovering the resident terrain root"))
+        if (!TryPinCells(ownerCells, "while discovering the resident terrain root"))
         {
             return;
         }
 
+        m_OwnerCells = ownerCells;
         m_RootGuid = root.RootGuid;
-        m_ExpectedTileCount = root.TileCount;
+        m_RootTileCount = root.TileCount;
         m_ExpectedLayerCount = root.Layers.Count;
-        m_InitialRebaseSequence = m_Origin.RebaseSequence;
+        m_CoreTiles.UnionWith(tiles.Select(tile => tile.TileGuid));
+        SetExpectedTiles(m_CoreTiles);
         BuildCameraPath(root.WorldBounds);
-        m_Streaming.ClearStreamingSource();
+        ClearStreamingSource();
         SetCamera(m_NearCameraPosition, m_NearRotation);
         PinStationaryAnimationClock();
-        ScheduleCapture("near", checked(frameIndex + 1));
-        m_Stage = TerrainStreamingSmokeStage.AwaitNearCapture;
+        m_Stage = TerrainStreamingSmokeStage.AwaitNearSettle;
     }
 
     /// <summary>
@@ -455,10 +509,12 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
     }
 
     /// <summary>
-    /// Whether the resident root is completely drawn for the view the published plan was computed
-    /// with. The snapshot carries that view, so the question stays per view: a tile the view sees
-    /// has to select at least one patch, and a tile outside it is only required to be resident,
-    /// valid and consistent with the total patch count.
+    /// Whether every resident tile of the root is completely drawn for the view the published plan
+    /// was computed with. The snapshot carries that view, so the question stays per view: a resident
+    /// tile the view sees has to select at least one patch, and a resident tile outside it is only
+    /// required to be prepared and consistent with the total patch count. Tiles the residency owners
+    /// do not hold are outside the gate: a root split across world cells is never fully resident, and
+    /// the held set the caller passes in is what the fixture pins and then keeps stable.
     /// </summary>
     internal static bool HasCompleteRenderSnapshot(
         TerrainDiagnosticsSnapshot snapshot,
@@ -468,12 +524,12 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         ArgumentNullException.ThrowIfNull(snapshot);
         ArgumentNullException.ThrowIfNull(root);
         ArgumentNullException.ThrowIfNull(tiles);
-        if (root.TileCount <= 0 ||
-            snapshot.Lod.SourceTileCount != root.TileCount ||
-            snapshot.Lod.ResidentTileCount != root.TileCount ||
+        if (tiles.Count == 0 ||
+            snapshot.Lod.SourceTileCount != tiles.Count ||
+            snapshot.Lod.ResidentTileCount != tiles.Count ||
             snapshot.Lod.SelectedPatchCount <= 0 ||
             snapshot.Lod.OverflowPatchCount != 0 ||
-            tiles.Count != root.TileCount)
+            root.ResidentTileCount != tiles.Count)
         {
             return false;
         }
@@ -497,20 +553,18 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         return patchCount == snapshot.Lod.SelectedPatchCount;
     }
 
-    private void BeginBoundaryCapture(uint frameIndex)
+    private void BeginBoundaryCapture()
     {
         SetCamera(m_BoundaryCameraPosition, m_BoundaryRotation);
-        m_Streaming.SetStreamingSource(m_BoundaryCameraPosition);
-        ScheduleCapture("boundary-mixed-lod", checked(frameIndex + 1));
-        m_Stage = TerrainStreamingSmokeStage.AwaitBoundaryCapture;
+        SetStreamingSource(m_BoundaryCameraPosition);
+        m_Stage = TerrainStreamingSmokeStage.AwaitBoundarySettle;
     }
 
-    private void BeginFarCapture(uint frameIndex)
+    private void BeginFarCapture()
     {
         SetCamera(m_FarCameraPosition, m_FarRotation);
-        m_Streaming.SetStreamingSource(m_FarCameraPosition);
-        ScheduleCapture("far-cascade", checked(frameIndex + 1));
-        m_Stage = TerrainStreamingSmokeStage.AwaitFarCapture;
+        SetStreamingSource(m_FarCameraPosition);
+        m_Stage = TerrainStreamingSmokeStage.AwaitFarSettle;
     }
 
     /// <summary>
@@ -520,12 +574,11 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
     /// corner, and the diagonal corner is beyond the camera's far plane - so the aggregate coverage
     /// check would fail without this capture.
     /// </summary>
-    private void BeginMirrorCapture(uint frameIndex)
+    private void BeginMirrorCapture()
     {
         SetCamera(m_MirrorCameraPosition, m_MirrorRotation);
-        m_Streaming.SetStreamingSource(m_MirrorCameraPosition);
-        ScheduleCapture("mirror-cascade", checked(frameIndex + 1));
-        m_Stage = TerrainStreamingSmokeStage.AwaitMirrorCapture;
+        SetStreamingSource(m_MirrorCameraPosition);
+        m_Stage = TerrainStreamingSmokeStage.AwaitMirrorSettle;
     }
 
     /// <summary>
@@ -536,45 +589,79 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
     /// pair that also replayed a camera path would fold the origin change, the terrain residency
     /// churn and the LOD history of that path into the same frame difference, and the fixture could
     /// not tell a rebase regression from the expected change of a mixed-LOD plan.
+    /// <para>
+    /// The residency the parked pose was captured with is pinned before the source moves. The rebase
+    /// is sourced from outside the partition, which empties the plan around the parked camera, and a
+    /// regional root only ever holds part of itself resident: without the pin, the cells that carry
+    /// the parked frame would unload underneath it and the capture pair would compare a rebase against
+    /// a reload. Pinning them keeps the tile set, the LOD plan and the frame independent of where the
+    /// source points, so the origin is the only variable the pair sees.
+    /// </para>
     /// </summary>
     private void BeginOriginRebase()
     {
-        m_Streaming.SetStreamingSource(m_RebaseSource);
+        TerrainTileDiagnosticSnapshot[] tiles = ResidentTiles(m_Diagnostics.GetSnapshot());
+        TerrainStreamingOwnerCells? parkedCells = TerrainStreamingOwnerCells.TryCreate(
+            m_World!,
+            tiles,
+            out string ownerDiagnostic);
+        if (parkedCells == null)
+        {
+            ReportFailure(ownerDiagnostic);
+            return;
+        }
+
+        if (!TryPinCells(parkedCells, "for the origin rebase"))
+        {
+            return;
+        }
+
+        m_ParkedCells = parkedCells;
+        SetExpectedTiles(m_CoreTiles.Union(tiles.Select(tile => tile.TileGuid)));
+        m_RebaseSequenceBeforeStep = m_Origin.RebaseSequence;
+        SetStreamingSource(m_RebaseSource);
         m_Stage = TerrainStreamingSmokeStage.AwaitOriginRebase;
     }
 
     /// <summary>
-    /// Waits for the sourced rebase and captures the parked far pose again. The frame is not
-    /// re-staged through <c>SetCamera</c>: the origin service has just shifted every origin-relative
-    /// transform, the camera included, so the capture only matches the pre-rebase far capture while
-    /// the rebase preserved the parked view.
+    /// Waits for the sourced rebase and drops the source, which leaves the pinned parked set as the
+    /// whole resident set. The frame is not re-staged through <c>SetCamera</c>: the origin service has
+    /// just shifted every origin-relative transform, the camera included, so the capture only matches
+    /// the pre-rebase far capture while the rebase preserved the parked view. The step is required to
+    /// move the origin by exactly one rebase; the regional root crosses more than one origin grid on
+    /// the flight, so the arithmetic starts from the sequence this step was begun with.
     /// </summary>
-    private void ObserveOriginRebase(uint frameIndex)
+    private void ObserveOriginRebase()
     {
-        long expectedSequence = checked(m_InitialRebaseSequence + 1);
+        long expectedSequence = checked(m_RebaseSequenceBeforeStep + 1);
         if (m_Origin.RebaseSequence < expectedSequence) return;
         if (m_Origin.RebaseSequence != expectedSequence)
         {
-            ReportFailure("Terrain camera path triggered more than one origin rebase.");
+            ReportFailure("The terrain origin rebase step triggered more than one origin rebase.");
             return;
         }
 
-        m_Streaming.ClearStreamingSource();
-        ScheduleCapture("post-rebase", checked(frameIndex + 1));
-        m_Stage = TerrainStreamingSmokeStage.AwaitPostRebaseCapture;
+        ClearStreamingSource();
+        m_Stage = TerrainStreamingSmokeStage.AwaitPostRebaseSettle;
     }
 
-    private void BeginReturnedCapture(uint frameIndex)
+    /// <summary>
+    /// Returns the camera to the near pose and releases the parked set. The pose is then captured with
+    /// the pinned core as the whole resident set, which is the residency the near capture was taken
+    /// with, so the returning frame has to match it.
+    /// </summary>
+    private void BeginReturnedCapture()
     {
+        if (!TryUnpinParkedCells("after the origin rebase")) return;
+        SetExpectedTiles(m_CoreTiles);
         SetCamera(m_NearCameraPosition, m_NearRotation);
-        ScheduleCapture("returned-start", checked(frameIndex + 1));
-        m_Stage = TerrainStreamingSmokeStage.AwaitReturnedCapture;
+        m_Stage = TerrainStreamingSmokeStage.AwaitReturnedSettle;
     }
 
     private void BeginInitialUnload()
     {
         Time.Unpin();
-        m_Streaming.ClearStreamingSource();
+        ClearStreamingSource();
         if (!TryUnpinOwnerCells("before soak validation")) return;
         m_Stage = TerrainStreamingSmokeStage.AwaitInitialUnload;
     }
@@ -625,12 +712,15 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             m_SoakCurrentGenerations[cell.CellId] = cell.RequestGeneration;
         }
 
-        TerrainTileDiagnosticSnapshot[] tiles = m_Diagnostics.GetSnapshot().Tiles
-            .Where(tile => tile.TerrainRootGuid == m_RootGuid)
-            .ToArray();
+        // The soak runs with the streaming source cleared, so the pinned core is the whole resident
+        // set. The reload has to bring every required tile back under the owner cells' newer request
+        // generation, and the residency gate that admitted this stage already proved the set exact.
+        TerrainTileDiagnosticSnapshot[] tiles = ResidentTiles(m_Diagnostics.GetSnapshot());
+        HashSet<Guid> residentGuids = tiles.Select(tile => tile.TileGuid).ToHashSet();
         bool currentOwnerGeneration =
-            tiles.Length == m_ExpectedTileCount &&
+            tiles.Length != 0 &&
             m_OwnerCells != null &&
+            m_ExpectedTiles.All(residentGuids.Contains) &&
             tiles.All(tile => m_OwnerCells.IsTileOwnedByCurrentGeneration(
                 tile,
                 m_SoakCurrentGenerations));
@@ -664,12 +754,29 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         TerrainTileComponent[] components = m_RenderSource.ExtractVisibleTiles().ToArray();
         TerrainRootDiagnosticSnapshot? root = snapshot.Roots.SingleOrDefault(candidate =>
             candidate.RootGuid == m_RootGuid);
-        TerrainTileDiagnosticSnapshot[] tiles = snapshot.Tiles
-            .Where(tile => tile.TerrainRootGuid == m_RootGuid)
-            .OrderBy(tile => tile.Coordinate.Z)
-            .ThenBy(tile => tile.Coordinate.X)
-            .ThenBy(tile => tile.TileGuid)
-            .ToArray();
+        TerrainTileDiagnosticSnapshot[] tiles = ResidentTiles(snapshot);
+        HashSet<WorldCellId> holders = ActiveTileHolders();
+        HashSet<Guid> residentGuids = tiles.Select(tile => tile.TileGuid).ToHashSet();
+        // The residency contract is two-sided. Every resident tile has to be held by one of the
+        // cells the streaming service still keeps alive, so a released cell cannot leave a prepared
+        // tile behind. The pinned core has to be resident at every pose: the fixture pinned its
+        // owner cells to freeze that set, and a pose that drops it would silently shrink the gate.
+        // The render source draws the resident set, so the ECS tiles have to match it one for one,
+        // and only a pose that clears the streaming source leaves the pinned core alone resident.
+        bool residencyValid =
+            tiles.All(tile => IsOwnedByHolder(tile, holders)) &&
+            m_ExpectedTiles.All(residentGuids.Contains) &&
+            components.Length == tiles.Length;
+        if (!m_PlanDriven)
+        {
+            residencyValid &= tiles.Length == m_ExpectedTiles.Count;
+        }
+
+        residencyValid &=
+            components.Select(component => component.TileGuid).Distinct().Count() ==
+                components.Length &&
+            components.All(component => component.TerrainRootGuid == m_RootGuid) &&
+            components.All(component => residentGuids.Contains(component.TileGuid));
         // The coverage contract is per view: this checkpoint requires every tile its own plan view
         // sees to select at least one patch, and only those. A resident tile outside the view
         // legitimately selects nothing once the root is wider than the frustum, and the aggregate
@@ -683,16 +790,12 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             bool expected = planView.IsFrustumVisible(tile.WorldBounds);
             expectedTiles[index] = expected;
             if (expected) expectedTileCount++;
-            tilesValid &= ValidateTile(tile, expected);
+            tilesValid &= ValidateTile(tile, expected, holders);
         }
 
         bool valid = root != null &&
             IsTerrainReady(snapshot) &&
-            components.Length == m_ExpectedTileCount &&
-            components.Select(component => component.TileGuid).Distinct().Count() ==
-                m_ExpectedTileCount &&
-            components.All(component => component.TerrainRootGuid == m_RootGuid) &&
-            tiles.Length == m_ExpectedTileCount &&
+            residencyValid &&
             expectedTileCount > 0 &&
             tilesValid &&
             tiles.Sum(tile => tile.Patches.Count) == snapshot.Lod.SelectedPatchCount &&
@@ -778,32 +881,45 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
     }
 
     /// <summary>
-    /// The aggregate half of the coverage contract: between them the captured views have to see
-    /// every canonical tile of the resident root. A view cannot frame a root wider than its own
-    /// frustum, so without this requirement a regional root would quietly reduce the gate to
-    /// whichever part of the world one corner happens to frame.
+    /// The aggregate half of the coverage contract: between them the captured views have to see every
+    /// tile the fixture requires. A view cannot frame a root wider than its own frustum, so without
+    /// this requirement a regional root would quietly reduce the gate to whichever part of the world
+    /// one corner happens to frame. The required set is the fixture's own: the pinned core, plus the
+    /// cells parked for the origin rebase while that comparison is live. The plan may have more tiles
+    /// resident than that at a given pose - the regional plan loads cells around the streaming source
+    /// as well - and those are covered by the per-view half of the contract at their own checkpoint.
     /// </summary>
     private void ValidateCoveredTiles()
     {
-        if (m_ExpectedTileCount <= 0 || m_CoveredTiles.Count == m_ExpectedTileCount)
+        if (m_ExpectedTiles.Count == 0 || m_ExpectedTiles.IsSubsetOf(m_CoveredTiles))
         {
             return;
         }
 
         const int maximumReportedTiles = 8;
         string[] missing = m_Diagnostics.GetSnapshot().Tiles
-            .Where(tile => tile.TerrainRootGuid == m_RootGuid && !m_CoveredTiles.Contains(tile.TileGuid))
+            .Where(tile => m_ExpectedTiles.Contains(tile.TileGuid) &&
+                !m_CoveredTiles.Contains(tile.TileGuid))
             .OrderBy(tile => tile.Coordinate.Z)
             .ThenBy(tile => tile.Coordinate.X)
             .Take(maximumReportedTiles)
             .Select(tile => $"({tile.Coordinate.X},{tile.Coordinate.Z})")
             .ToArray();
         ReportFailure(
-            $"Terrain camera path covered {m_CoveredTiles.Count} of {m_ExpectedTileCount} " +
-            $"canonical tile(s): no captured pose sees {string.Join(", ", missing)}.");
+            $"Terrain camera path covered {m_CoveredTiles.Count} of {m_ExpectedTiles.Count} " +
+            $"required tile(s): no captured pose sees {string.Join(", ", missing)}.");
     }
 
-    private bool ValidateTile(TerrainTileDiagnosticSnapshot tile, bool expected)
+    /// <summary>
+    /// One resident tile of a checkpoint. The tile has to be prepared, visible, seam-clean and drawn
+    /// by the view that frames it, and it has to be owned by a cell the streamer still holds. The
+    /// tiles the fixture requires are additionally owned by the cells it pinned: a pose that handed
+    /// one of them to an unpinned cell would mean the pin did not carry the set it was taken for.
+    /// </summary>
+    private bool ValidateTile(
+        TerrainTileDiagnosticSnapshot tile,
+        bool expected,
+        HashSet<WorldCellId> holders)
     {
         if (tile.ResidencyState != RuntimePreparedAssetState.Ready ||
             !tile.IsVisible ||
@@ -811,8 +927,8 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             tile.SeamViolationCount != 0 ||
             (expected && tile.Patches.Count == 0) ||
             !tile.WorldBounds.IsValid ||
-            m_OwnerCells is not { } ownerCells ||
-            !ownerCells.IsTileOwnedBySet(tile))
+            !IsOwnedByHolder(tile, holders) ||
+            (m_ExpectedTiles.Contains(tile.TileGuid) && !IsOwnedByPinnedCell(tile)))
         {
             return false;
         }
@@ -832,9 +948,15 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         return true;
     }
 
+    private bool IsOwnedByPinnedCell(TerrainTileDiagnosticSnapshot tile) =>
+        (m_OwnerCells?.IsTileOwnedBySet(tile) ?? false) ||
+        (m_ParkedCells?.IsTileOwnedBySet(tile) ?? false);
+
     /// <summary>
-    /// Every owner cell of the resident root has to reach the loaded state together, and the root
-    /// itself has to be completely resident and drawn, before the soak may act on it.
+    /// Every pinned owner cell of the resident root has to reach the loaded state together, and the
+    /// residency the soak acts on has to be settled, before the soak may act on it. The soak runs
+    /// with the streaming source cleared, so the pinned core is the whole resident set and the gate
+    /// can require it exactly.
     /// </summary>
     private bool TerrainCellsReady(out WorldCellStreamingSnapshot[] cells)
     {
@@ -859,18 +981,8 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         }
 
         TerrainDiagnosticsSnapshot snapshot = m_Diagnostics.GetSnapshot();
-        bool rootReady =
-            IsTerrainReady(snapshot) &&
-            snapshot.Lod.SourceTileCount == m_ExpectedTileCount &&
-            snapshot.Lod.ResidentTileCount == m_ExpectedTileCount &&
-            snapshot.Lod.SelectedPatchCount > 0 &&
-            snapshot.Tiles.Count(tile => tile.TerrainRootGuid == m_RootGuid) ==
-                m_ExpectedTileCount &&
-            snapshot.Tiles
-                .Where(tile => tile.TerrainRootGuid == m_RootGuid)
-                .All(tile => tile.IsVisible && tile.Patches.Count > 0) &&
-            m_RenderSource.ExtractVisibleTiles().Length == m_ExpectedTileCount;
-        if (!rootReady) return false;
+        if (snapshot.Lod.SelectedPatchCount <= 0 || !IsTerrainReady(snapshot)) return false;
+        if (!ResidencySettled(exact: true)) return false;
         cells = ready;
         return true;
     }
@@ -896,8 +1008,13 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             return false;
         }
 
+        return TryPinCells(ownerCells, purpose);
+    }
+
+    private bool TryPinCells(TerrainStreamingOwnerCells cells, string purpose)
+    {
         int pinned = 0;
-        foreach (WorldCellDescriptor cell in ownerCells.Cells)
+        foreach (WorldCellDescriptor cell in cells.Cells)
         {
             if (m_Streaming.PinCell(cell.Id))
             {
@@ -907,7 +1024,7 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
 
             ReportFailure(
                 $"Could not pin terrain owner cell '{cell.Id}' {purpose} " +
-                $"({pinned} of {ownerCells.Count} pinned).");
+                $"({pinned} of {cells.Count} pinned).");
             return false;
         }
 
@@ -923,8 +1040,13 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             return false;
         }
 
+        return TryUnpinCells(ownerCells, purpose);
+    }
+
+    private bool TryUnpinCells(TerrainStreamingOwnerCells cells, string purpose)
+    {
         int unpinned = 0;
-        foreach (WorldCellDescriptor cell in ownerCells.Cells)
+        foreach (WorldCellDescriptor cell in cells.Cells)
         {
             if (m_Streaming.UnpinCell(cell.Id))
             {
@@ -934,10 +1056,49 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
 
             ReportFailure(
                 $"Could not unpin terrain owner cell '{cell.Id}' {purpose} " +
-                $"({unpinned} of {ownerCells.Count} unpinned).");
+                $"({unpinned} of {cells.Count} unpinned).");
             return false;
         }
 
+        return true;
+    }
+
+    /// <summary>
+    /// Releases the cells pinned to carry the parked pose across the origin rebase. They are the cells
+    /// that pose needed and not the fixture's owner core, so the soak that follows still acts on the
+    /// core alone. A cell the core also owns keeps its pin: the streamer stores the pin as one flag
+    /// per cell rather than a reference count, and the parked set of a pose that frames the core
+    /// always contains the core cells, so clearing the flag for a shared cell would drop the core the
+    /// rest of the run is pinned on.
+    /// </summary>
+    private bool TryUnpinParkedCells(string purpose)
+    {
+        TerrainStreamingOwnerCells? parkedCells = m_ParkedCells;
+        if (parkedCells == null) return true;
+
+        int released = 0;
+        int retained = 0;
+        foreach (WorldCellDescriptor cell in parkedCells.Cells)
+        {
+            if (m_OwnerCells?.Contains(cell.Id) == true)
+            {
+                retained++;
+                continue;
+            }
+
+            if (m_Streaming.UnpinCell(cell.Id))
+            {
+                released++;
+                continue;
+            }
+
+            ReportFailure(
+                $"Could not unpin parked terrain cell '{cell.Id}' {purpose} " +
+                $"({released} of {parkedCells.Count - retained} unpinned).");
+            return false;
+        }
+
+        m_ParkedCells = null;
         return true;
     }
 
@@ -982,6 +1143,14 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         return m_LastDrainSnapshot.IsDrained;
     }
 
+    /// <summary>
+    /// Whether the resident root is complete, ready and seam-clean at the tiles the streamer
+    /// currently holds. A regional root is never wholly resident: the cooked tile count is what the
+    /// root declares, while the resident count is whatever the plan around the streaming source
+    /// loaded, so the root is complete when its resident tiles are all ready and none of them
+    /// violates a seam. The fixtures own expectation - the pinned set and any parked cells - has to
+    /// be inside that resident set.
+    /// </summary>
     private bool IsTerrainReady(TerrainDiagnosticsSnapshot snapshot)
     {
         if (snapshot.SeamViolationCount != 0 ||
@@ -997,15 +1166,12 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             : snapshot.Roots.Where(root => root.RootGuid == m_RootGuid).ToArray();
         if (roots.Length != 1) return false;
         TerrainRootDiagnosticSnapshot root = roots[0];
-        int expectedTiles = m_ExpectedTileCount == 0 ? root.TileCount : m_ExpectedTileCount;
-        TerrainTileDiagnosticSnapshot[] tiles = snapshot.Tiles
-            .Where(tile => tile.TerrainRootGuid == root.RootGuid)
-            .ToArray();
-        return expectedTiles > 0 &&
+        TerrainTileDiagnosticSnapshot[] tiles = ResidentTiles(snapshot, root.RootGuid);
+        if (tiles.Length == 0 || root.ResidentTileCount != tiles.Length) return false;
+        HashSet<Guid> residentGuids = tiles.Select(tile => tile.TileGuid).ToHashSet();
+        return (m_ExpectedTiles.Count == 0 || m_ExpectedTiles.All(residentGuids.Contains)) &&
             root.ResidencyState == RuntimePreparedAssetState.Ready &&
-            root.ResidentTileCount == expectedTiles &&
             !root.IsFailed &&
-            tiles.Length == expectedTiles &&
             tiles.All(tile =>
                 tile.ResidencyState == RuntimePreparedAssetState.Ready &&
                 !tile.IsFailed &&
@@ -1091,13 +1257,17 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             return;
         }
 
-        if (m_ExpectedTileCount > 0)
+        if (m_RootTileCount > 0)
         {
+            // A regional root is only ever partly resident, so the pinned set cannot bound residency
+            // here. The root's own cooked tile count can: no plan holds more tiles of a root
+            // resident than the root declares, and the descriptors are bounded by the layers of the
+            // single resident root.
             int disposalLimit = Math.Max(
                 32,
-                checked((m_ExpectedTileCount * 8) + (m_ExpectedLayerCount * 6)));
+                checked((m_RootTileCount * 8) + (m_ExpectedLayerCount * 6)));
             if (terrain.Residency.ResidentRootCount > 1 ||
-                terrain.Residency.ResidentTileCount > m_ExpectedTileCount ||
+                terrain.Residency.ResidentTileCount > m_RootTileCount ||
                 terrain.Residency.LayerDescriptorCount > m_ExpectedLayerCount ||
                 terrain.Residency.PendingDisposalCount > disposalLimit ||
                 terrain.Lod.SelectedPatchCount > TerrainLodSettings.Default.MaximumPatchCount)
@@ -1279,6 +1449,202 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             : double.NaN;
     }
 
+    /// <summary>
+    /// The canonical tiles of the resident root the residency owners currently hold. A root whose
+    /// tiles are split across world cells is only ever partially resident, so every expectation in
+    /// this fixture follows the held tiles instead of the cooked tile count.
+    /// </summary>
+    private TerrainTileDiagnosticSnapshot[] ResidentTiles(TerrainDiagnosticsSnapshot snapshot)
+    {
+        if (m_RootGuid != Guid.Empty) return ResidentTiles(snapshot, m_RootGuid);
+        // Discovery runs before the fixture has adopted a root identity, and reaches this question
+        // only while exactly one root reports residents, so the root is read off the snapshot there.
+        Guid[] residentRoots = snapshot.Roots
+            .Where(root => root.ResidentTileCount > 0)
+            .Select(root => root.RootGuid)
+            .ToArray();
+        return residentRoots.Length == 1
+            ? ResidentTiles(snapshot, residentRoots[0])
+            : Array.Empty<TerrainTileDiagnosticSnapshot>();
+    }
+
+    private static TerrainTileDiagnosticSnapshot[] ResidentTiles(
+        TerrainDiagnosticsSnapshot snapshot,
+        Guid rootGuid) => snapshot.Tiles
+        .Where(tile => tile.TerrainRootGuid == rootGuid && tile.Generation != 0)
+        .OrderBy(tile => tile.Coordinate.Z)
+        .ThenBy(tile => tile.Coordinate.X)
+        .ThenBy(tile => tile.TileGuid)
+        .ToArray();
+
+    /// <summary>
+    /// The world cells the streaming service currently holds a scene instance for. A canonical tile
+    /// may only be resident while one of these cells owns it, so this set is the fixture's
+    /// independent half of the residency contract.
+    /// </summary>
+    private HashSet<WorldCellId> ActiveTileHolders() => m_Streaming.GetCells()
+        .Where(cell => cell.State is WorldCellStreamingState.Active or
+            WorldCellStreamingState.QueuedToUnload or
+            WorldCellStreamingState.Unloading)
+        .Select(cell => cell.CellId)
+        .ToHashSet();
+
+    /// <summary>
+    /// Whether one of the world cells the streaming service still holds owns the tile. The fixture
+    /// pins the cells it discovered the root through, but a plan-driven pose holds extra cells too,
+    /// and the residency contract is the same for both: a prepared tile has to be owned by a cell the
+    /// streamer still keeps alive, so a released cell can never leave a prepared tile behind.
+    /// </summary>
+    private static bool IsOwnedByHolder(
+        TerrainTileDiagnosticSnapshot tile,
+        HashSet<WorldCellId> holders)
+    {
+        for (int index = 0; index < tile.Owners.Count; index++)
+        {
+            RuntimeAssetResidencyOwnerId owner = tile.Owners[index];
+            if (owner.Kind == RuntimeAssetResidencyOwnerKind.WorldCell &&
+                owner.CellId.IsValid &&
+                holders.Contains(owner.CellId))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Whether the residency a capture is about to record has settled. Cell activation, unloading and
+    /// the residency release behind them are frame-bounded by the fixture's own streaming budgets, so
+    /// a capture taken before the plan settled would record a transient residency - and the visual
+    /// pairs the validator compares would then differ by the state of the streamer instead of by the
+    /// origin or the pose they are about. A pose is only captured once every cell the plan still
+    /// wants is active, every cell it has dropped is gone, the ECS tile set is exactly the resident
+    /// tile set, the published plan saw that same set, and the tiles the fixture requires are
+    /// resident. A cell applies its tiles to the ECS at the frame boundary, after the plan of that
+    /// frame was computed, so the frame that loaded the last cell reports tiles the plan never drew;
+    /// the plan's own source and resident counts are what prove the capture is taken on the frame
+    /// that replanned over them.
+    /// <para>
+    /// <paramref name="exact"/> additionally requires the resident set to be exactly the required
+    /// set. That is the contract of a pose with no streaming source: only the pinned cells can hold
+    /// tiles there, so every such pose publishes the same set.
+    /// </para>
+    /// </summary>
+    private bool ResidencySettled(bool exact)
+    {
+        TerrainDiagnosticsSnapshot snapshot = m_Diagnostics.GetSnapshot();
+        TerrainTileDiagnosticSnapshot[] tiles = ResidentTiles(snapshot);
+        if (tiles.Length == 0) return false;
+        HashSet<Guid> residentGuids = tiles.Select(tile => tile.TileGuid).ToHashSet();
+        if (!m_ExpectedTiles.All(residentGuids.Contains)) return false;
+        if (exact && tiles.Length != m_ExpectedTiles.Count) return false;
+        if (m_RenderSource.ExtractVisibleTiles().Length != tiles.Length ||
+            snapshot.Lod.SourceTileCount != tiles.Length ||
+            snapshot.Lod.ResidentTileCount != tiles.Length)
+        {
+            return false;
+        }
+        HashSet<WorldCellId> holders = ActiveTileHolders();
+        if (!tiles.All(tile => IsOwnedByHolder(tile, holders))) return false;
+        foreach (WorldCellStreamingSnapshot cell in m_Streaming.GetCells())
+        {
+            if (cell.Desired)
+            {
+                if (cell.State != WorldCellStreamingState.Active) return false;
+                continue;
+            }
+
+            if (cell.State is not (WorldCellStreamingState.Unloaded or
+                WorldCellStreamingState.Cancelled))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private void SetExpectedTiles(IEnumerable<Guid> tiles)
+    {
+        m_ExpectedTiles.Clear();
+        m_ExpectedTiles.UnionWith(tiles);
+    }
+
+    /// <summary>
+    /// Whether every origin rebase the run observed paired one starting event with one completion
+    /// under the same sequence, and whether the fixture sourced at least one of them. The regional
+    /// root spans more than one origin grid at the partition's hysteresis, so flying across it has to
+    /// rebase more than once; the gate is that pairing plus the per-rebase invariant below, with the
+    /// parked far pose the fixture captures before and after its own rebase carrying the frame
+    /// comparison.
+    /// </summary>
+    private bool RebasesAreBalanced()
+    {
+        if (m_RebaseStarts.Count == 0 || m_RebaseStarts.Count != m_RebaseCompletions.Count)
+        {
+            return false;
+        }
+
+        for (int index = 0; index < m_RebaseStarts.Count; index++)
+        {
+            if (m_RebaseStarts[index] != m_RebaseCompletions[index]) return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// A rebase moves the rendering space under a fixed world space, so the world-space pose of the
+    /// fixture's camera has to survive every rebase unchanged. The origin-relative transform is a
+    /// float, so a shift re-rounds it at the world coordinate's magnitude: the tolerance stays at a
+    /// centimetre, far above that rounding and far below any origin error this gate is about.
+    /// </summary>
+    private void VerifyRebaseInvariant()
+    {
+        long sequence = m_Origin.RebaseSequence;
+        if (sequence == m_LastRebaseSequence) return;
+        m_LastRebaseSequence = sequence;
+        if (m_EntityManager == null ||
+            !m_EntityManager.IsAlive(m_CameraEntity) ||
+            !m_EntityManager.HasComponent<TransformComponent>(m_CameraEntity))
+        {
+            ReportFailure("The terrain camera did not survive an origin rebase.");
+            return;
+        }
+
+        WorldPosition camera = m_Origin.ToWorld(
+            m_EntityManager.GetComponent<TransformComponent>(m_CameraEntity).Position);
+        double deltaX = camera.X - m_CurrentCameraPosition.X;
+        double deltaY = camera.Y - m_CurrentCameraPosition.Y;
+        double deltaZ = camera.Z - m_CurrentCameraPosition.Z;
+        if (Math.Sqrt((deltaX * deltaX) + (deltaY * deltaY) + (deltaZ * deltaZ)) >
+            RebasePositionTolerance)
+        {
+            ReportFailure(
+                $"Origin rebase {sequence} moved the camera from the pose the fixture staged it at.");
+        }
+    }
+
+    /// <summary>
+    /// Sets the streaming source and records that the published plan, not only the pinned owner
+    /// cells, now decides which tiles are resident.
+    /// </summary>
+    private void SetStreamingSource(WorldPosition position)
+    {
+        m_Streaming.SetStreamingSource(position);
+        m_PlanDriven = true;
+    }
+
+    /// <summary>
+    /// Clears the streaming source, which leaves the pinned owner cells as the whole resident set.
+    /// </summary>
+    private void ClearStreamingSource()
+    {
+        m_Streaming.ClearStreamingSource();
+        m_PlanDriven = false;
+    }
+
     private void SetCamera(WorldPosition worldPosition, in Quaternion rotation)
     {
         if (!m_EntityManager!.IsAlive(m_CameraEntity) ||
@@ -1348,7 +1714,7 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         RuntimeVisualSummaryCaptureResult[] captures =
             m_Context.VisualSummaryService?.GetCaptureResults().ToArray() ?? [];
         var artifact = new TerrainStreamingSmokeArtifact(
-            SchemaVersion: 3,
+            SchemaVersion: 4,
             CapturedAtUtc: DateTime.UtcNow,
             Mode: Name,
             Profile: m_Context.ProfileName,
@@ -1356,6 +1722,7 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             TerrainRootGuid: m_RootGuid,
             TerrainCellIds: m_OwnerCells?.IdStrings() ?? Array.Empty<string>(),
             CoveredTileCount: m_CoveredTiles.Count,
+            RootTileCount: m_RootTileCount,
             Passed: Succeeded,
             Failure: m_FailureMessage,
             RequestedSoakCycles: SoakCycleCount,
@@ -1478,12 +1845,18 @@ internal enum TerrainStreamingSmokeStage
     None,
     AwaitStartupWorld,
     AwaitDiscovery,
+    AwaitNearSettle,
     AwaitNearCapture,
+    AwaitBoundarySettle,
     AwaitBoundaryCapture,
+    AwaitMirrorSettle,
     AwaitMirrorCapture,
+    AwaitFarSettle,
     AwaitFarCapture,
     AwaitOriginRebase,
+    AwaitPostRebaseSettle,
     AwaitPostRebaseCapture,
+    AwaitReturnedSettle,
     AwaitReturnedCapture,
     AwaitInitialUnload,
     AwaitSoakLoad,
@@ -1501,6 +1874,7 @@ internal sealed record TerrainStreamingSmokeArtifact(
     Guid TerrainRootGuid,
     IReadOnlyList<string> TerrainCellIds,
     int CoveredTileCount,
+    int RootTileCount,
     bool Passed,
     string? Failure,
     int RequestedSoakCycles,
