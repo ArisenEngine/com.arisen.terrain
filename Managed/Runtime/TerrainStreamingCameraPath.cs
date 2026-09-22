@@ -11,6 +11,8 @@ internal readonly record struct TerrainStreamingCameraPoses(
     Quaternion NearRotation,
     WorldPosition BoundaryPosition,
     Quaternion BoundaryRotation,
+    WorldPosition MirrorPosition,
+    Quaternion MirrorRotation,
     WorldPosition FarPosition,
     Quaternion FarRotation);
 
@@ -24,21 +26,29 @@ internal delegate double TerrainSurfaceHeightSampler(double worldX, double world
 /// Camera path owned by the terrain-streaming smoke fixture.
 ///
 /// Every checkpoint the fixture captures has to satisfy three independent contracts at once. The
-/// checkpoint capture rejects a tile that reports no selected patch, so the frustum has to reach
-/// every canonical tile of the root; the visual capture rejects a frame that writes no depth, so the
-/// frame has to contain the terrain surface rather than only sky; and the summary validator rejects
-/// an inverted frame whose ground sits above the horizon in the image, so the surface has to stay
-/// under a view that keeps the sky on top.
+/// checkpoint capture rejects a resident tile that the checkpoint's own plan view sees and that
+/// reports no selected patch, so a view has to draw whatever it frames; the visual capture rejects a
+/// frame that writes no depth, so the frame has to contain the terrain surface rather than only sky;
+/// and the summary validator rejects an inverted frame whose ground sits above the horizon in the
+/// image, so the surface has to stay under a view that keeps the sky on top.
 ///
-/// The coverage contract is a constraint on where a captured pose can stand once the root grows
-/// past a single view. The frustum spans roughly 73 degrees horizontally at the fixture's 45 degree
-/// vertical field of view and 16:9 aspect, while the canonical ShowcaseValley root covers a 512 m
-/// square: a pose anywhere inside that square has the raster all around it, so the tiles behind and
-/// beside the view direction fall outside the frustum and select no patch at all. Only the root's
-/// corner regions put the whole raster ahead of the camera, because the square occupies a single
-/// quadrant seen from a corner and the frustum wedge still reaches the opposite corner's tiles.
+/// The coverage contract is a per-view contract, not a whole-root one, because a single frustum
+/// cannot contain a root that is wider than it is. Each captured view is required to cover the tiles
+/// its own frustum sees, and the captured views together are required to cover every canonical tile
+/// of the root. A root that fits in one view is still covered by every pose, which keeps the
+/// single-block gate at full strength: the frustum spans roughly 73 degrees horizontally at the
+/// fixture's 45 degree vertical field of view and 16:9 aspect, and the canonical ShowcaseValley root
+/// covers a 512 m square, whose diagonal still sits inside the 900 m far plane. A root that does not
+/// fit keeps only the per-view subset, and the aggregate requirement is what stops the gate from
+/// silently shrinking to whichever part of the world one view happens to frame.
+///
 /// Every captured pose therefore stands <see cref="CornerInsetFraction"/> inside one of the four
-/// corners of the root.
+/// corners of the root, and all four corners are captured. A view looks *away* from its own corner
+/// and never frames the ground under itself, so a corner is covered by the views standing away from
+/// it; on a root wider than one frustum the diagonal corner is also beyond the camera's far plane,
+/// which leaves the corner of any unvisited corner region framed by no view at all and the
+/// aggregate requirement unsatisfiable. The third captured pose is the mirror of the boundary pose
+/// across the near-to-far diagonal and exists for exactly that uncovered corner.
 ///
 /// The authored showcase camera remains the scene's own starting view, and the fixture cannot
 /// inherit it: it stands inside the raster, where no aim can frame the whole root. The fixture keeps
@@ -107,6 +117,8 @@ internal static class TerrainStreamingCameraPath
             Aim(rootBounds, corners[0]),
             corners[1],
             Aim(rootBounds, corners[1]),
+            corners[2],
+            Aim(rootBounds, corners[2]),
             corners[^1],
             Aim(rootBounds, corners[^1]));
     }
@@ -114,8 +126,9 @@ internal static class TerrainStreamingCameraPath
     /// <summary>
     /// The four corner regions of the terrain root, ordered by their distance to the authored camera
     /// position so every fixture pose stays deterministic: the closest corner is the near pose, the
-    /// next one the boundary pose, and the farthest the far pose. Every one of them frames the whole
-    /// root, and the three captures that use them are three different views of it.
+    /// next one the boundary pose, the one after it mirrors the boundary pose across the near-to-far
+    /// diagonal, and the farthest is the far pose. A root that fits inside one frustum is framed by
+    /// every one of them, and a root wider than one frustum is covered by their union instead.
     /// </summary>
     private static WorldPosition[] CornerPoses(
         in TerrainPatchWorldBounds rootBounds,

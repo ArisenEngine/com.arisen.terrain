@@ -107,10 +107,12 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
     private WorldPosition m_OriginalCameraPosition;
     private WorldPosition m_NearCameraPosition;
     private WorldPosition m_BoundaryCameraPosition;
+    private WorldPosition m_MirrorCameraPosition;
     private WorldPosition m_FarCameraPosition;
     private WorldPosition m_CurrentCameraPosition;
     private Quaternion m_NearRotation;
     private Quaternion m_BoundaryRotation;
+    private Quaternion m_MirrorRotation;
     private Quaternion m_FarRotation;
     private Guid m_RootGuid;
     private int m_ExpectedTileCount;
@@ -118,6 +120,7 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
     private long m_InitialRebaseSequence;
     private readonly Dictionary<WorldCellId, long> m_SoakReloadGenerations = new();
     private readonly Dictionary<WorldCellId, long> m_SoakCurrentGenerations = new();
+    private readonly HashSet<Guid> m_CoveredTiles = new();
     private string m_PendingCapture = string.Empty;
     private uint m_PendingCaptureFrame;
     private TerrainStreamingSmokeBounds? m_LoadedBounds;
@@ -231,6 +234,13 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
                 if (CaptureCompleted("boundary-mixed-lod", frameIndex))
                 {
                     CaptureCheckpoint("boundary-mixed-lod", frameIndex);
+                    BeginMirrorCapture(frameIndex);
+                }
+                break;
+            case TerrainStreamingSmokeStage.AwaitMirrorCapture:
+                if (CaptureCompleted("mirror-cascade", frameIndex))
+                {
+                    CaptureCheckpoint("mirror-cascade", frameIndex);
                     BeginFarCapture(frameIndex);
                 }
                 break;
@@ -255,6 +265,8 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
                 if (CaptureCompleted("returned-start", frameIndex))
                 {
                     CaptureCheckpoint("returned-start", frameIndex);
+                    ValidateCoveredTiles();
+                    if (m_FailureMessage != null) return;
                     BeginInitialUnload();
                 }
                 break;
@@ -339,11 +351,11 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             RuntimeVisualSummaryCaptureResult[] captures =
                 m_Context.VisualSummaryService?.GetCaptureResults().ToArray() ?? [];
             if (captures.Length != 0 &&
-                (captures.Length != 5 || captures.Any(capture =>
+                (captures.Length != 6 || captures.Any(capture =>
                     capture.State != RuntimeVisualSummaryCaptureState.Succeeded)))
             {
                 m_FailureMessage ??=
-                    "Terrain visual validation did not complete all five named captures.";
+                    "Terrain visual validation did not complete all six named captures.";
             }
         }
         catch (Exception ex)
@@ -442,6 +454,12 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         Time.Pin(Time.elapsedTime);
     }
 
+    /// <summary>
+    /// Whether the resident root is completely drawn for the view the published plan was computed
+    /// with. The snapshot carries that view, so the question stays per view: a tile the view sees
+    /// has to select at least one patch, and a tile outside it is only required to be resident,
+    /// valid and consistent with the total patch count.
+    /// </summary>
     internal static bool HasCompleteRenderSnapshot(
         TerrainDiagnosticsSnapshot snapshot,
         TerrainRootDiagnosticSnapshot root,
@@ -468,7 +486,7 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
                 tile.ResidencyState != RuntimePreparedAssetState.Ready ||
                 !tile.IsVisible ||
                 tile.IsFailed ||
-                tile.Patches.Count == 0)
+                (tile.Patches.Count == 0 && snapshot.PlanView.IsFrustumVisible(tile.WorldBounds)))
             {
                 return false;
             }
@@ -493,6 +511,21 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         m_Streaming.SetStreamingSource(m_FarCameraPosition);
         ScheduleCapture("far-cascade", checked(frameIndex + 1));
         m_Stage = TerrainStreamingSmokeStage.AwaitFarCapture;
+    }
+
+    /// <summary>
+    /// Captures the fourth corner of the root. The near, boundary and far poses frame three of the
+    /// four corners the fixture's path visits; on a root wider than one frustum the corner region of
+    /// the fourth is out of sight of all three - a view never frames the ground under its own
+    /// corner, and the diagonal corner is beyond the camera's far plane - so the aggregate coverage
+    /// check would fail without this capture.
+    /// </summary>
+    private void BeginMirrorCapture(uint frameIndex)
+    {
+        SetCamera(m_MirrorCameraPosition, m_MirrorRotation);
+        m_Streaming.SetStreamingSource(m_MirrorCameraPosition);
+        ScheduleCapture("mirror-cascade", checked(frameIndex + 1));
+        m_Stage = TerrainStreamingSmokeStage.AwaitMirrorCapture;
     }
 
     /// <summary>
@@ -627,6 +660,7 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
     private TerrainStreamingSmokeCheckpoint CaptureCheckpoint(string name, uint frameIndex)
     {
         TerrainDiagnosticsSnapshot snapshot = m_Diagnostics.GetSnapshot();
+        TerrainLodView planView = snapshot.PlanView;
         TerrainTileComponent[] components = m_RenderSource.ExtractVisibleTiles().ToArray();
         TerrainRootDiagnosticSnapshot? root = snapshot.Roots.SingleOrDefault(candidate =>
             candidate.RootGuid == m_RootGuid);
@@ -636,6 +670,22 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             .ThenBy(tile => tile.Coordinate.X)
             .ThenBy(tile => tile.TileGuid)
             .ToArray();
+        // The coverage contract is per view: this checkpoint requires every tile its own plan view
+        // sees to select at least one patch, and only those. A resident tile outside the view
+        // legitimately selects nothing once the root is wider than the frustum, and the aggregate
+        // check the flight ends with is what keeps every canonical tile accounted for.
+        var expectedTiles = new bool[tiles.Length];
+        int expectedTileCount = 0;
+        bool tilesValid = true;
+        for (int index = 0; index < tiles.Length; index++)
+        {
+            TerrainTileDiagnosticSnapshot tile = tiles[index];
+            bool expected = planView.IsFrustumVisible(tile.WorldBounds);
+            expectedTiles[index] = expected;
+            if (expected) expectedTileCount++;
+            tilesValid &= ValidateTile(tile, expected);
+        }
+
         bool valid = root != null &&
             IsTerrainReady(snapshot) &&
             components.Length == m_ExpectedTileCount &&
@@ -643,7 +693,8 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
                 m_ExpectedTileCount &&
             components.All(component => component.TerrainRootGuid == m_RootGuid) &&
             tiles.Length == m_ExpectedTileCount &&
-            tiles.All(tile => ValidateTile(tile)) &&
+            expectedTileCount > 0 &&
+            tilesValid &&
             tiles.Sum(tile => tile.Patches.Count) == snapshot.Lod.SelectedPatchCount &&
             snapshot.Lod.SelectedPatchCount > 0 &&
             snapshot.Lod.OverflowPatchCount == 0 &&
@@ -688,16 +739,18 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             m_Origin.GetSnapshot(),
             m_RootGuid,
             m_OwnerCells?.IdStrings() ?? Array.Empty<string>(),
-            tiles.Select(tile => new TerrainStreamingTileSnapshot(
+            tiles.Select((tile, index) => new TerrainStreamingTileSnapshot(
                 tile.TileGuid,
                 tile.Coordinate,
                 tile.Generation,
                 tile.MinimumSelectedLod,
                 tile.MaximumSelectedLod,
                 tile.Patches.Count,
+                expectedTiles[index],
                 tile.WorldBounds,
                 tile.SeamViolationCount,
                 TerrainTileOwnerCellIds(tile))).ToArray(),
+            expectedTileCount,
             BuildLodHistogram(tiles),
             snapshot.Lod,
             snapshot.SeamViolationCount,
@@ -709,22 +762,54 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         if (!valid)
         {
             ReportFailure(
-                $"Terrain checkpoint '{name}' found a tile with no selected patch, invalid " +
-                "residency, LOD, patch bounds, ECS ownership, query parity, or seam state.");
+                $"Terrain checkpoint '{name}' found a tile its own view sees with no selected " +
+                "patch, a view that sees no tile at all, or a tile with invalid residency, LOD, " +
+                "patch bounds, ECS ownership, query parity, or seam state.");
             return checkpoint;
+        }
+
+        for (int index = 0; index < tiles.Length; index++)
+        {
+            if (expectedTiles[index]) m_CoveredTiles.Add(tiles[index].TileGuid);
         }
 
         ValidateLoadedBounds(memory);
         return checkpoint;
     }
 
-    private bool ValidateTile(TerrainTileDiagnosticSnapshot tile)
+    /// <summary>
+    /// The aggregate half of the coverage contract: between them the captured views have to see
+    /// every canonical tile of the resident root. A view cannot frame a root wider than its own
+    /// frustum, so without this requirement a regional root would quietly reduce the gate to
+    /// whichever part of the world one corner happens to frame.
+    /// </summary>
+    private void ValidateCoveredTiles()
+    {
+        if (m_ExpectedTileCount <= 0 || m_CoveredTiles.Count == m_ExpectedTileCount)
+        {
+            return;
+        }
+
+        const int maximumReportedTiles = 8;
+        string[] missing = m_Diagnostics.GetSnapshot().Tiles
+            .Where(tile => tile.TerrainRootGuid == m_RootGuid && !m_CoveredTiles.Contains(tile.TileGuid))
+            .OrderBy(tile => tile.Coordinate.Z)
+            .ThenBy(tile => tile.Coordinate.X)
+            .Take(maximumReportedTiles)
+            .Select(tile => $"({tile.Coordinate.X},{tile.Coordinate.Z})")
+            .ToArray();
+        ReportFailure(
+            $"Terrain camera path covered {m_CoveredTiles.Count} of {m_ExpectedTileCount} " +
+            $"canonical tile(s): no captured pose sees {string.Join(", ", missing)}.");
+    }
+
+    private bool ValidateTile(TerrainTileDiagnosticSnapshot tile, bool expected)
     {
         if (tile.ResidencyState != RuntimePreparedAssetState.Ready ||
             !tile.IsVisible ||
             tile.IsFailed ||
             tile.SeamViolationCount != 0 ||
-            tile.Patches.Count == 0 ||
+            (expected && tile.Patches.Count == 0) ||
             !tile.WorldBounds.IsValid ||
             m_OwnerCells is not { } ownerCells ||
             !ownerCells.IsTileOwnedBySet(tile))
@@ -1174,6 +1259,8 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         m_NearRotation = poses.NearRotation;
         m_BoundaryCameraPosition = poses.BoundaryPosition;
         m_BoundaryRotation = poses.BoundaryRotation;
+        m_MirrorCameraPosition = poses.MirrorPosition;
+        m_MirrorRotation = poses.MirrorRotation;
         m_FarCameraPosition = poses.FarPosition;
         m_FarRotation = poses.FarRotation;
     }
@@ -1261,13 +1348,14 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         RuntimeVisualSummaryCaptureResult[] captures =
             m_Context.VisualSummaryService?.GetCaptureResults().ToArray() ?? [];
         var artifact = new TerrainStreamingSmokeArtifact(
-            SchemaVersion: 2,
+            SchemaVersion: 3,
             CapturedAtUtc: DateTime.UtcNow,
             Mode: Name,
             Profile: m_Context.ProfileName,
             WorldGuid: m_World?.WorldGuid ?? Guid.Empty,
             TerrainRootGuid: m_RootGuid,
             TerrainCellIds: m_OwnerCells?.IdStrings() ?? Array.Empty<string>(),
+            CoveredTileCount: m_CoveredTiles.Count,
             Passed: Succeeded,
             Failure: m_FailureMessage,
             RequestedSoakCycles: SoakCycleCount,
@@ -1392,6 +1480,7 @@ internal enum TerrainStreamingSmokeStage
     AwaitDiscovery,
     AwaitNearCapture,
     AwaitBoundaryCapture,
+    AwaitMirrorCapture,
     AwaitFarCapture,
     AwaitOriginRebase,
     AwaitPostRebaseCapture,
@@ -1411,6 +1500,7 @@ internal sealed record TerrainStreamingSmokeArtifact(
     Guid WorldGuid,
     Guid TerrainRootGuid,
     IReadOnlyList<string> TerrainCellIds,
+    int CoveredTileCount,
     bool Passed,
     string? Failure,
     int RequestedSoakCycles,
@@ -1431,6 +1521,7 @@ internal sealed record TerrainStreamingSmokeCheckpoint(
     Guid TerrainRootGuid,
     IReadOnlyList<string> TerrainCellIds,
     IReadOnlyList<TerrainStreamingTileSnapshot> Tiles,
+    int ExpectedTileCount,
     IReadOnlyList<TerrainStreamingLodBucket> LodHistogram,
     TerrainLodMetrics Lod,
     int SeamViolationCount,
@@ -1446,6 +1537,7 @@ internal sealed record TerrainStreamingTileSnapshot(
     int MinimumLod,
     int MaximumLod,
     int PatchCount,
+    bool FrustumVisible,
     TerrainPatchWorldBounds WorldBounds,
     int SeamViolationCount,
     IReadOnlyList<string> OwnerCellIds);
