@@ -100,7 +100,7 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
     private readonly TerrainStreamingSmokePeaks m_Peaks = new();
     private WorldDescriptor? m_World;
     private EntityManager? m_EntityManager;
-    private WorldCellDescriptor? m_TerrainCell;
+    private TerrainStreamingOwnerCells? m_OwnerCells;
     private WorldPosition m_DiscoverySource;
     private WorldPosition m_RebaseSource;
     private Entity m_CameraEntity;
@@ -116,7 +116,8 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
     private int m_ExpectedTileCount;
     private int m_ExpectedLayerCount;
     private long m_InitialRebaseSequence;
-    private long m_ReloadGeneration;
+    private readonly Dictionary<WorldCellId, long> m_SoakReloadGenerations = new();
+    private readonly Dictionary<WorldCellId, long> m_SoakCurrentGenerations = new();
     private string m_PendingCapture = string.Empty;
     private uint m_PendingCaptureFrame;
     private TerrainStreamingSmokeBounds? m_LoadedBounds;
@@ -402,24 +403,18 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             return;
         }
 
-        WorldCellId[] ownerCells = tiles
-            .SelectMany(tile => tile.Owners)
-            .Where(owner => owner.Kind == RuntimeAssetResidencyOwnerKind.WorldCell)
-            .Select(owner => owner.CellId)
-            .Distinct()
-            .Order()
-            .ToArray();
-        if (ownerCells.Length != 1)
+        m_OwnerCells = TerrainStreamingOwnerCells.TryCreate(
+            m_World!,
+            tiles,
+            out string ownerDiagnostic);
+        if (m_OwnerCells == null)
         {
-            ReportFailure(
-                "Terrain-streaming fixture must attribute every canonical tile to one world cell.");
+            ReportFailure(ownerDiagnostic);
             return;
         }
 
-        m_TerrainCell = m_World!.Cells.SingleOrDefault(cell => cell.Id == ownerCells[0]);
-        if (m_TerrainCell == null || !m_Streaming.PinCell(m_TerrainCell.Id))
+        if (!TryPinOwnerCells("while discovering the resident terrain root"))
         {
-            ReportFailure("Could not pin the discovered terrain owner cell.");
             return;
         }
 
@@ -547,23 +542,13 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
     {
         Time.Unpin();
         m_Streaming.ClearStreamingSource();
-        if (m_TerrainCell == null || !m_Streaming.UnpinCell(m_TerrainCell.Id))
-        {
-            ReportFailure("Could not unpin the terrain cell before soak validation.");
-            return;
-        }
-
+        if (!TryUnpinOwnerCells("before soak validation")) return;
         m_Stage = TerrainStreamingSmokeStage.AwaitInitialUnload;
     }
 
     private void BeginSoakLoad()
     {
-        if (m_TerrainCell == null || !m_Streaming.PinCell(m_TerrainCell.Id))
-        {
-            ReportFailure("Could not pin the terrain cell for soak validation.");
-            return;
-        }
-
+        if (!TryPinOwnerCells("for soak validation")) return;
         // The reload soak verifies that repeated load/unload cycles return to the loaded steady
         // state the camera path reached. The baseline is frozen here, on the first cycle, so every
         // later cycle is compared against the same loaded world at the same camera pose.
@@ -573,15 +558,20 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
 
     private void ObserveSoakLoad(uint frameIndex)
     {
-        if (!TerrainCellReady(out WorldCellStreamingSnapshot cell)) return;
+        if (!TerrainCellsReady(out WorldCellStreamingSnapshot[] cells)) return;
         CaptureCheckpoint($"soak-load-{m_SoakCyclesCompleted + 1}", frameIndex);
         if (m_FailureMessage != null) return;
 
-        m_ReloadGeneration = cell.RequestGeneration;
-        if (!m_Streaming.RequestCellReload(cell.CellId))
+        m_SoakReloadGenerations.Clear();
+        foreach (WorldCellStreamingSnapshot cell in cells)
         {
-            ReportFailure("Terrain soak could not request an active-cell reload.");
-            return;
+            m_SoakReloadGenerations[cell.CellId] = cell.RequestGeneration;
+            if (!m_Streaming.RequestCellReload(cell.CellId))
+            {
+                ReportFailure(
+                    $"Terrain soak could not request a reload of owner cell '{cell.CellId}'.");
+                return;
+            }
         }
 
         m_Stage = TerrainStreamingSmokeStage.AwaitSoakReload;
@@ -589,27 +579,33 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
 
     private void ObserveSoakReload(uint frameIndex)
     {
-        if (!TerrainCellReady(out WorldCellStreamingSnapshot cell) ||
-            cell.RequestGeneration <= m_ReloadGeneration)
+        if (!TerrainCellsReady(out WorldCellStreamingSnapshot[] cells)) return;
+        m_SoakCurrentGenerations.Clear();
+        foreach (WorldCellStreamingSnapshot cell in cells)
         {
-            return;
+            if (!m_SoakReloadGenerations.TryGetValue(cell.CellId, out long reloaded) ||
+                cell.RequestGeneration <= reloaded)
+            {
+                return;
+            }
+
+            m_SoakCurrentGenerations[cell.CellId] = cell.RequestGeneration;
         }
 
-        TerrainDiagnosticsSnapshot snapshot = m_Diagnostics.GetSnapshot();
-        bool currentOwnerGeneration = snapshot.Tiles
+        TerrainTileDiagnosticSnapshot[] tiles = m_Diagnostics.GetSnapshot().Tiles
             .Where(tile => tile.TerrainRootGuid == m_RootGuid)
-            .All(tile => tile.Owners.Any(owner =>
-                owner.CellId == cell.CellId && owner.Generation == cell.RequestGeneration));
+            .ToArray();
+        bool currentOwnerGeneration =
+            tiles.Length == m_ExpectedTileCount &&
+            m_OwnerCells != null &&
+            tiles.All(tile => m_OwnerCells.IsTileOwnedByCurrentGeneration(
+                tile,
+                m_SoakCurrentGenerations));
         if (!currentOwnerGeneration) return;
 
         CaptureCheckpoint($"soak-reload-{m_SoakCyclesCompleted + 1}", frameIndex);
         if (m_FailureMessage != null) return;
-        if (!m_Streaming.UnpinCell(cell.CellId))
-        {
-            ReportFailure("Terrain soak could not unpin the reloaded cell.");
-            return;
-        }
-
+        if (!TryUnpinOwnerCells("after the soak reload")) return;
         m_Stage = TerrainStreamingSmokeStage.AwaitSoakUnload;
     }
 
@@ -691,7 +687,7 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             m_CurrentCameraPosition,
             m_Origin.GetSnapshot(),
             m_RootGuid,
-            m_TerrainCell?.Id.ToString() ?? string.Empty,
+            m_OwnerCells?.IdStrings() ?? Array.Empty<string>(),
             tiles.Select(tile => new TerrainStreamingTileSnapshot(
                 tile.TileGuid,
                 tile.Coordinate,
@@ -700,7 +696,8 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
                 tile.MaximumSelectedLod,
                 tile.Patches.Count,
                 tile.WorldBounds,
-                tile.SeamViolationCount)).ToArray(),
+                tile.SeamViolationCount,
+                TerrainTileOwnerCellIds(tile))).ToArray(),
             BuildLodHistogram(tiles),
             snapshot.Lod,
             snapshot.SeamViolationCount,
@@ -729,9 +726,8 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
             tile.SeamViolationCount != 0 ||
             tile.Patches.Count == 0 ||
             !tile.WorldBounds.IsValid ||
-            !tile.Owners.Any(owner =>
-                owner.Kind == RuntimeAssetResidencyOwnerKind.WorldCell &&
-                owner.CellId == m_TerrainCell!.Id))
+            m_OwnerCells is not { } ownerCells ||
+            !ownerCells.IsTileOwnedBySet(tile))
         {
             return false;
         }
@@ -751,15 +747,34 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         return true;
     }
 
-    private bool TerrainCellReady(out WorldCellStreamingSnapshot cell)
+    /// <summary>
+    /// Every owner cell of the resident root has to reach the loaded state together, and the root
+    /// itself has to be completely resident and drawn, before the soak may act on it.
+    /// </summary>
+    private bool TerrainCellsReady(out WorldCellStreamingSnapshot[] cells)
     {
-        cell = m_TerrainCell == null
-            ? null!
-            : m_Streaming.GetCells().Single(candidate => candidate.CellId == m_TerrainCell.Id);
+        cells = Array.Empty<WorldCellStreamingSnapshot>();
+        TerrainStreamingOwnerCells? ownerCells = m_OwnerCells;
+        if (ownerCells == null) return false;
+        IReadOnlyList<WorldCellStreamingSnapshot> streaming = m_Streaming.GetCells();
+        var ready = new WorldCellStreamingSnapshot[ownerCells.Count];
+        for (int index = 0; index < ready.Length; index++)
+        {
+            WorldCellStreamingSnapshot? cell = FindStreamingCell(
+                streaming,
+                ownerCells.Cells[index].Id);
+            if (cell == null ||
+                cell.State != WorldCellStreamingState.Active ||
+                !cell.Pinned)
+            {
+                return false;
+            }
+
+            ready[index] = cell;
+        }
+
         TerrainDiagnosticsSnapshot snapshot = m_Diagnostics.GetSnapshot();
-        return cell != null &&
-            cell.State == WorldCellStreamingState.Active &&
-            cell.Pinned &&
+        bool rootReady =
             IsTerrainReady(snapshot) &&
             snapshot.Lod.SourceTileCount == m_ExpectedTileCount &&
             snapshot.Lod.ResidentTileCount == m_ExpectedTileCount &&
@@ -770,23 +785,105 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
                 .Where(tile => tile.TerrainRootGuid == m_RootGuid)
                 .All(tile => tile.IsVisible && tile.Patches.Count > 0) &&
             m_RenderSource.ExtractVisibleTiles().Length == m_ExpectedTileCount;
+        if (!rootReady) return false;
+        cells = ready;
+        return true;
+    }
+
+    private static WorldCellStreamingSnapshot? FindStreamingCell(
+        IReadOnlyList<WorldCellStreamingSnapshot> cells,
+        WorldCellId cellId)
+    {
+        for (int index = 0; index < cells.Count; index++)
+        {
+            if (cells[index].CellId == cellId) return cells[index];
+        }
+
+        return null;
+    }
+
+    private bool TryPinOwnerCells(string purpose)
+    {
+        TerrainStreamingOwnerCells? ownerCells = m_OwnerCells;
+        if (ownerCells == null)
+        {
+            ReportFailure($"Terrain-streaming fixture has no owner cells to pin {purpose}.");
+            return false;
+        }
+
+        int pinned = 0;
+        foreach (WorldCellDescriptor cell in ownerCells.Cells)
+        {
+            if (m_Streaming.PinCell(cell.Id))
+            {
+                pinned++;
+                continue;
+            }
+
+            ReportFailure(
+                $"Could not pin terrain owner cell '{cell.Id}' {purpose} " +
+                $"({pinned} of {ownerCells.Count} pinned).");
+            return false;
+        }
+
+        return true;
+    }
+
+    private bool TryUnpinOwnerCells(string purpose)
+    {
+        TerrainStreamingOwnerCells? ownerCells = m_OwnerCells;
+        if (ownerCells == null)
+        {
+            ReportFailure($"Terrain-streaming fixture has no owner cells to unpin {purpose}.");
+            return false;
+        }
+
+        int unpinned = 0;
+        foreach (WorldCellDescriptor cell in ownerCells.Cells)
+        {
+            if (m_Streaming.UnpinCell(cell.Id))
+            {
+                unpinned++;
+                continue;
+            }
+
+            ReportFailure(
+                $"Could not unpin terrain owner cell '{cell.Id}' {purpose} " +
+                $"({unpinned} of {ownerCells.Count} unpinned).");
+            return false;
+        }
+
+        return true;
     }
 
     private bool TerrainDrained()
     {
-        if (m_TerrainCell == null) return false;
-        WorldCellStreamingSnapshot cell = m_Streaming.GetCells()
-            .Single(candidate => candidate.CellId == m_TerrainCell.Id);
+        TerrainStreamingOwnerCells? ownerCells = m_OwnerCells;
+        if (ownerCells == null) return false;
+        IReadOnlyList<WorldCellStreamingSnapshot> streaming = m_Streaming.GetCells();
+        var cells = new TerrainStreamingCellDrainSnapshot[ownerCells.Count];
+        for (int index = 0; index < cells.Length; index++)
+        {
+            WorldCellId cellId = ownerCells.Cells[index].Id;
+            WorldCellStreamingSnapshot? cell = FindStreamingCell(streaming, cellId);
+            cells[index] = cell == null
+                ? TerrainStreamingCellDrainSnapshot.Untracked(cellId)
+                : new TerrainStreamingCellDrainSnapshot(
+                    cellId.ToString(),
+                    Tracked: true,
+                    cell.State,
+                    cell.Desired,
+                    cell.DesiredSources,
+                    cell.Pinned);
+        }
+
         TerrainDiagnosticsSnapshot diagnostics = m_Diagnostics.GetSnapshot();
         TerrainRuntimeDataMetrics runtimeData = m_RuntimeData.GetMetrics();
         RuntimeAssetResidencySnapshot[] terrainResources = m_Residency.GetResources()
             .Where(resource => resource.Key.AssetType is "TerrainRoot" or "TerrainTile")
             .ToArray();
         m_LastDrainSnapshot = new TerrainStreamingDrainSnapshot(
-            cell.State,
-            cell.Desired,
-            cell.DesiredSources,
-            cell.Pinned,
+            cells,
             m_RenderSource.ExtractVisibleTiles().Length,
             runtimeData.RootCount,
             runtimeData.TileCount,
@@ -1164,13 +1261,13 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         RuntimeVisualSummaryCaptureResult[] captures =
             m_Context.VisualSummaryService?.GetCaptureResults().ToArray() ?? [];
         var artifact = new TerrainStreamingSmokeArtifact(
-            SchemaVersion: 1,
+            SchemaVersion: 2,
             CapturedAtUtc: DateTime.UtcNow,
             Mode: Name,
             Profile: m_Context.ProfileName,
             WorldGuid: m_World?.WorldGuid ?? Guid.Empty,
             TerrainRootGuid: m_RootGuid,
-            TerrainCellId: m_TerrainCell?.Id.ToString() ?? string.Empty,
+            TerrainCellIds: m_OwnerCells?.IdStrings() ?? Array.Empty<string>(),
             Passed: Succeeded,
             Failure: m_FailureMessage,
             RequestedSoakCycles: SoakCycleCount,
@@ -1187,15 +1284,45 @@ internal sealed class TerrainStreamingSmokeScenario : IRuntimeSmokeScenario
         string? directory = Path.GetDirectoryName(OutputPath);
         if (!string.IsNullOrWhiteSpace(directory)) Directory.CreateDirectory(directory);
         string temporaryPath = OutputPath + ".tmp." + Guid.NewGuid().ToString("N");
-        string json = JsonSerializer.Serialize(artifact, new JsonSerializerOptions
-        {
-            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-            WriteIndented = true,
-            IncludeFields = true,
-            Converters = { new JsonStringEnumConverter() }
-        });
+        string json = JsonSerializer.Serialize(artifact, ArtifactSerializerOptions);
         File.WriteAllText(temporaryPath, json, new UTF8Encoding(false));
         File.Move(temporaryPath, OutputPath, overwrite: true);
+    }
+
+    /// <summary>
+    /// The gate scripts read the artifact by these exact camel-case names. The owner-cell set and
+    /// the per-cell drain rows are part of the published contract, so the options are shared with
+    /// the tests that pin that contract instead of being rebuilt at the write site.
+    /// </summary>
+    internal static readonly JsonSerializerOptions ArtifactSerializerOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        WriteIndented = true,
+        IncludeFields = true,
+        Converters = { new JsonStringEnumConverter() }
+    };
+
+    /// <summary>
+    /// The world cells that hold the tile, as published per checkpoint tile. Non-world-cell owners
+    /// (the persistent scene) are not part of the terrain owner-cell contract.
+    /// </summary>
+    private static string[] TerrainTileOwnerCellIds(TerrainTileDiagnosticSnapshot tile)
+    {
+        var ids = new List<string>();
+        for (int index = 0; index < tile.Owners.Count; index++)
+        {
+            RuntimeAssetResidencyOwnerId owner = tile.Owners[index];
+            if (owner.Kind != RuntimeAssetResidencyOwnerKind.WorldCell || !owner.CellId.IsValid)
+            {
+                continue;
+            }
+
+            string id = owner.CellId.ToString();
+            if (!ids.Contains(id)) ids.Add(id);
+        }
+
+        ids.Sort(StringComparer.Ordinal);
+        return ids.ToArray();
     }
 
     private static IReadOnlyList<TerrainStreamingLodBucket> BuildLodHistogram(
@@ -1283,7 +1410,7 @@ internal sealed record TerrainStreamingSmokeArtifact(
     string Profile,
     Guid WorldGuid,
     Guid TerrainRootGuid,
-    string TerrainCellId,
+    IReadOnlyList<string> TerrainCellIds,
     bool Passed,
     string? Failure,
     int RequestedSoakCycles,
@@ -1302,7 +1429,7 @@ internal sealed record TerrainStreamingSmokeCheckpoint(
     WorldPosition CameraWorldPosition,
     WorldOriginSnapshot Origin,
     Guid TerrainRootGuid,
-    string TerrainCellId,
+    IReadOnlyList<string> TerrainCellIds,
     IReadOnlyList<TerrainStreamingTileSnapshot> Tiles,
     IReadOnlyList<TerrainStreamingLodBucket> LodHistogram,
     TerrainLodMetrics Lod,
@@ -1320,7 +1447,8 @@ internal sealed record TerrainStreamingTileSnapshot(
     int MaximumLod,
     int PatchCount,
     TerrainPatchWorldBounds WorldBounds,
-    int SeamViolationCount);
+    int SeamViolationCount,
+    IReadOnlyList<string> OwnerCellIds);
 
 internal sealed record TerrainStreamingLodBucket(int Level, int PatchCount);
 
@@ -1357,11 +1485,37 @@ internal sealed record TerrainStreamingSmokeBounds(
     int TerrainLayerDescriptors,
     int SelectedPatches);
 
+/// <summary>
+/// One owner cell of the resident root at a drain boundary. An owner cell the streaming service no
+/// longer tracks publishes <see cref="Tracked"/> false and a null state instead of a fabricated
+/// state, and never counts as drained.
+/// </summary>
+internal readonly record struct TerrainStreamingCellDrainSnapshot(
+    string CellId,
+    bool Tracked,
+    WorldCellStreamingState? State,
+    bool Desired,
+    WorldCellDesiredSource DesiredSources,
+    bool Pinned)
+{
+    public static TerrainStreamingCellDrainSnapshot Untracked(WorldCellId cellId) => new(
+        cellId.ToString(),
+        Tracked: false,
+        State: null,
+        Desired: false,
+        DesiredSources: WorldCellDesiredSource.None,
+        Pinned: false);
+
+    public bool IsDrained =>
+        Tracked &&
+        State is WorldCellStreamingState.Unloaded or WorldCellStreamingState.Cancelled &&
+        !Desired &&
+        !Pinned &&
+        DesiredSources == WorldCellDesiredSource.None;
+}
+
 internal readonly record struct TerrainStreamingDrainSnapshot(
-    WorldCellStreamingState CellState,
-    bool CellDesired,
-    WorldCellDesiredSource CellDesiredSources,
-    bool CellPinned,
+    IReadOnlyList<TerrainStreamingCellDrainSnapshot> Cells,
     int VisibleTileCount,
     int RuntimeRootCount,
     int RuntimeTileCount,
@@ -1374,9 +1528,9 @@ internal readonly record struct TerrainStreamingDrainSnapshot(
     int OutstandingTaskCount)
 {
     public bool IsDrained =>
-        CellState is WorldCellStreamingState.Unloaded or WorldCellStreamingState.Cancelled &&
-        !CellDesired &&
-        !CellPinned &&
+        Cells != null &&
+        Cells.Count > 0 &&
+        Cells.All(cell => cell.IsDrained) &&
         VisibleTileCount == 0 &&
         RuntimeRootCount == 0 &&
         RuntimeTileCount == 0 &&
