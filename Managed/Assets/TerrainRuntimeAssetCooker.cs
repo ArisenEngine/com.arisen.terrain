@@ -14,6 +14,12 @@ public sealed class TerrainRuntimeAssetCooker : IRuntimeAssetCooker
 
     public string ProviderId => "com.arisen.terrain.runtime-asset-cooker";
 
+    // Terrain cooking is safe to run concurrently: the cooker keeps no state of its own, every input
+    // comes from the asset database (which is lock-protected), and each request writes only the
+    // cooked file it owns. Tile payloads are independent, so a batch of tile requests is a batch of
+    // raster decodes the coordinator may run on several cores.
+    public bool SupportsConcurrentCooking => true;
+
     public IReadOnlyCollection<string> AssetTypes { get; } =
     [
         TerrainAssetTypes.Root,

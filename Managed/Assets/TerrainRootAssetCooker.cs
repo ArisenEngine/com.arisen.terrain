@@ -37,6 +37,12 @@ public static class TerrainRootAssetCooker
     private const int MaxCookedRootBytes = 64 * 1024 * 1024;
     private const int MaxStringBytes = 16 * 1024;
     private const string TextureAssetType = "Texture2D";
+
+    // A tile payload is built from read-only decoded raster data into its own slot, so the build loop
+    // may use several cores. The bound keeps the peak payload allocation of a wide grid reasonable.
+    private static readonly int MaxTileBuildDegreeOfParallelism =
+        System.Math.Min(Environment.ProcessorCount, 8);
+
     private static readonly byte[] s_Magic = Encoding.ASCII.GetBytes("ARITROOT");
     private static readonly HashSet<uint> s_KnownSections =
     [
@@ -73,14 +79,36 @@ public static class TerrainRootAssetCooker
             : TerrainWeightSourceDecoder.DecodeFile(root.WeightSource.ResolvedPath);
 
         var tiles = new CookedTerrainTile[root.GeneratedTiles.Count];
-        for (int index = 0; index < root.GeneratedTiles.Count; index++)
+        var buildFailures = new Exception?[tiles.Length];
+        Parallel.For(
+            0,
+            root.GeneratedTiles.Count,
+            new ParallelOptions { MaxDegreeOfParallelism = MaxTileBuildDegreeOfParallelism },
+            index =>
+            {
+                try
+                {
+                    tiles[index] = TerrainTileAssetCooker.BuildTile(
+                        root,
+                        layerSet,
+                        heightField,
+                        root.GeneratedTiles[index],
+                        weightField);
+                }
+                catch (Exception failure)
+                {
+                    buildFailures[index] = failure;
+                }
+            });
+
+        // The lowest coordinate that failed is the one reported, so a rejected tile fails the cook
+        // with the same exception type and message a sequential build would have produced.
+        for (int index = 0; index < buildFailures.Length; index++)
         {
-            tiles[index] = TerrainTileAssetCooker.BuildTile(
-                root,
-                layerSet,
-                heightField,
-                root.GeneratedTiles[index],
-                weightField);
+            if (buildFailures[index] is Exception failure)
+            {
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+            }
         }
 
         TerrainTileAssetCooker.ValidateSharedBorders(tiles);
