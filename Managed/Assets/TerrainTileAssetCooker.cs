@@ -55,6 +55,26 @@ public static class TerrainTileAssetCooker
             out TerrainGeneratedTileRecord tileRecord);
         TerrainLayerSetSourceDescriptor layerSet =
             TerrainLayerSetSourceAssetLoader.LoadSource(assetDatabase, root.LayerSet);
+
+        // A tile that is already current is returned from the cooked cache instead of decoding the
+        // root's raster again: the full cook asks for every tile of a root that the root cook has just
+        // published, and that request used to re-decode the whole raster per tile.
+        DateTime newestSourceWriteTimeUtc = TerrainCookStaleness.GetNewestSourceWriteTimeUtc(
+            assetDatabase,
+            root,
+            layerSet);
+        if (TerrainRootAssetCooker.TryReuseTileArtifact(
+                assetDatabase,
+                root,
+                layerSet,
+                tileRecord,
+                newestSourceWriteTimeUtc,
+                out _,
+                out CookedTerrainTileArtifact reused))
+        {
+            return reused;
+        }
+
         TerrainHeightField heightField = TerrainHeightSourceDecoder.DecodeFile(
             root.HeightSource.ResolvedPath);
         TerrainWeightField? weightField = root.WeightSource == null

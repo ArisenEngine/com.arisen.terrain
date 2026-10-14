@@ -22,6 +22,102 @@ public sealed record TerrainIncrementalCookResult(
     IReadOnlyList<TerrainTileCoordinate> DependencyRecookedTiles,
     IReadOnlyList<TerrainTileCoordinate> ReusedTiles);
 
+/// <summary>
+/// What one full root cook reused and rebuilt. Reusing a root means the raster was not decoded and no
+/// tile payload was loaded, which is why the report names it separately from the tiles it kept.
+/// </summary>
+internal readonly record struct TerrainRootCookReport(
+    CookedTerrainRootArtifact RootArtifact,
+    bool ReusedRoot,
+    IReadOnlyList<TerrainTileCoordinate> ReusedTiles,
+    IReadOnlyList<TerrainTileCoordinate> RebuiltTiles);
+
+/// <summary>
+/// Cook staleness for terrain, stated the way the other cooked asset kinds state it: a cooked output
+/// is current while it is not older than the sources it was built from. Terrain used to be the one
+/// path that rebuilt unconditionally, so every request re-decoded the root's raster and republished
+/// its tiles even when nothing had changed.
+///
+/// The stamp is filesystem metadata (write time, and length through the asset records) rather than a
+/// content hash, which matches how the mesh, texture, material, and environment cookers decide to
+/// re-cook. A source edited and restored with an older write time still rebuilds through the
+/// descriptor comparison below, and an authored change that removes a weight source changes the root
+/// descriptor, which is itself part of the stamp. The stamp is per source file, so editing the raster
+/// rebuilds every tile of that root; rebuilding only the tiles whose samples changed would need a
+/// per-region stamp recorded in the cooked payload.
+/// </summary>
+internal static class TerrainCookStaleness
+{
+    internal static DateTime GetNewestSourceWriteTimeUtc(
+        IAssetDatabase assetDatabase,
+        TerrainRootSourceDescriptor root,
+        TerrainLayerSetSourceDescriptor layerSet)
+    {
+        DateTime newest = DateTime.MinValue;
+        newest = GetNewestWriteTimeUtc(newest, assetDatabase, root.Guid);
+        newest = GetNewestWriteTimeUtc(newest, root.HeightSource.ResolvedPath);
+        newest = GetNewestWriteTimeUtc(newest, root.HeightSource.ResolvedPath + ".meta");
+        if (root.WeightSource != null)
+        {
+            newest = GetNewestWriteTimeUtc(newest, root.WeightSource.ResolvedPath);
+            newest = GetNewestWriteTimeUtc(newest, root.WeightSource.ResolvedPath + ".meta");
+        }
+
+        return GetNewestWriteTimeUtc(newest, assetDatabase, layerSet.Guid);
+    }
+
+    internal static bool TryGetCurrentCookedArtifact(
+        IAssetDatabase assetDatabase,
+        Guid guid,
+        string variant,
+        DateTime newestSourceWriteTimeUtc,
+        out CookedAssetRecord artifact)
+    {
+        artifact = null!;
+        if (newestSourceWriteTimeUtc == DateTime.MinValue ||
+            !assetDatabase.TryGetCookedArtifact(guid, variant, out CookedAssetRecord? cooked) ||
+            cooked == null ||
+            string.IsNullOrWhiteSpace(cooked.Path) ||
+            !File.Exists(cooked.Path))
+        {
+            return false;
+        }
+
+        if (File.GetLastWriteTimeUtc(cooked.Path) < newestSourceWriteTimeUtc)
+        {
+            return false;
+        }
+
+        artifact = cooked;
+        return true;
+    }
+
+    private static DateTime GetNewestWriteTimeUtc(
+        DateTime newest,
+        IAssetDatabase assetDatabase,
+        Guid guid)
+    {
+        if (!assetDatabase.TryGetAsset(guid, out AssetRecord? asset))
+        {
+            return newest;
+        }
+
+        newest = GetNewestWriteTimeUtc(newest, asset.SourcePath);
+        return GetNewestWriteTimeUtc(newest, asset.MetaPath);
+    }
+
+    private static DateTime GetNewestWriteTimeUtc(DateTime newest, string path)
+    {
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            return newest;
+        }
+
+        DateTime writeTimeUtc = File.GetLastWriteTimeUtc(path);
+        return writeTimeUtc > newest ? writeTimeUtc : newest;
+    }
+}
+
 public static class TerrainRootAssetCooker
 {
     public const string RuntimeVariant = "runtime.terrain-root.v2";
@@ -56,11 +152,21 @@ public static class TerrainRootAssetCooker
         IAssetDatabase assetDatabase,
         AssetRef<TerrainRootSourceAsset> rootRef)
     {
-        CookedTerrainRoot? previousRoot = TryLoadPreviousCookedRoot(assetDatabase, rootRef);
-        return Cook(assetDatabase, rootRef, previousRoot);
+        return CookWithReport(assetDatabase, rootRef).RootArtifact;
     }
 
+    internal static TerrainRootCookReport CookWithReport(
+        IAssetDatabase assetDatabase,
+        AssetRef<TerrainRootSourceAsset> rootRef) =>
+        CookWithReport(assetDatabase, rootRef, TryLoadPreviousCookedRoot(assetDatabase, rootRef));
+
     internal static CookedTerrainRootArtifact Cook(
+        IAssetDatabase assetDatabase,
+        AssetRef<TerrainRootSourceAsset> rootRef,
+        CookedTerrainRoot? previousRoot) =>
+        CookWithReport(assetDatabase, rootRef, previousRoot).RootArtifact;
+
+    internal static TerrainRootCookReport CookWithReport(
         IAssetDatabase assetDatabase,
         AssetRef<TerrainRootSourceAsset> rootRef,
         CookedTerrainRoot? previousRoot)
@@ -72,58 +178,187 @@ public static class TerrainRootAssetCooker
             rootRef);
         TerrainLayerSetSourceDescriptor layerSet =
             TerrainLayerSetSourceAssetLoader.LoadSource(assetDatabase, root.LayerSet);
-        TerrainHeightField heightField = TerrainHeightSourceDecoder.DecodeFile(
-            root.HeightSource.ResolvedPath);
-        TerrainWeightField? weightField = root.WeightSource == null
-            ? null
-            : TerrainWeightSourceDecoder.DecodeFile(root.WeightSource.ResolvedPath);
 
-        var tiles = new CookedTerrainTile[root.GeneratedTiles.Count];
-        var buildFailures = new Exception?[tiles.Length];
-        Parallel.For(
-            0,
-            root.GeneratedTiles.Count,
-            new ParallelOptions { MaxDegreeOfParallelism = MaxTileBuildDegreeOfParallelism },
-            index =>
-            {
-                try
-                {
-                    tiles[index] = TerrainTileAssetCooker.BuildTile(
-                        root,
-                        layerSet,
-                        heightField,
-                        root.GeneratedTiles[index],
-                        weightField);
-                }
-                catch (Exception failure)
-                {
-                    buildFailures[index] = failure;
-                }
-            });
-
-        // The lowest coordinate that failed is the one reported, so a rejected tile fails the cook
-        // with the same exception type and message a sequential build would have produced.
-        for (int index = 0; index < buildFailures.Length; index++)
+        // A root that is already current costs one metadata pass: the raster is not decoded and no
+        // tile payload is loaded. Cooking the same root once per scatter recipe and once per scene
+        // used to re-decode the whole raster and republish every tile on each of those calls.
+        if (previousRoot != null &&
+            TryReuseRoot(assetDatabase, root, layerSet, previousRoot, out CookedTerrainRootArtifact? existing))
         {
-            if (buildFailures[index] is Exception failure)
+            return new TerrainRootCookReport(
+                existing,
+                ReusedRoot: true,
+                previousRoot.Tiles.Select(tile => tile.Coordinate).ToArray(),
+                Array.Empty<TerrainTileCoordinate>());
+        }
+
+        DateTime newestSourceWriteTimeUtc = TerrainCookStaleness.GetNewestSourceWriteTimeUtc(
+            assetDatabase,
+            root,
+            layerSet);
+        var tiles = new CookedTerrainTile[root.GeneratedTiles.Count];
+        var tileArtifacts = new CookedTerrainTileArtifact[tiles.Length];
+        var reusedTiles = new List<TerrainTileCoordinate>(tiles.Length);
+        var rebuild = new List<int>(tiles.Length);
+        for (int index = 0; index < root.GeneratedTiles.Count; index++)
+        {
+            TerrainGeneratedTileRecord record = root.GeneratedTiles[index];
+            if (TryReuseTileArtifact(
+                    assetDatabase,
+                    root,
+                    layerSet,
+                    record,
+                    newestSourceWriteTimeUtc,
+                    out CookedTerrainTile reusedTile,
+                    out CookedTerrainTileArtifact reusedArtifact))
             {
-                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+                tiles[index] = reusedTile;
+                tileArtifacts[index] = reusedArtifact;
+                reusedTiles.Add(record.Coordinate);
+                continue;
+            }
+
+            rebuild.Add(index);
+        }
+
+        if (rebuild.Count > 0)
+        {
+            TerrainHeightField heightField = TerrainHeightSourceDecoder.DecodeFile(
+                root.HeightSource.ResolvedPath);
+            TerrainWeightField? weightField = root.WeightSource == null
+                ? null
+                : TerrainWeightSourceDecoder.DecodeFile(root.WeightSource.ResolvedPath);
+            var buildFailures = new Exception?[rebuild.Count];
+            Parallel.For(
+                0,
+                rebuild.Count,
+                new ParallelOptions { MaxDegreeOfParallelism = MaxTileBuildDegreeOfParallelism },
+                offset =>
+                {
+                    try
+                    {
+                        tiles[rebuild[offset]] = TerrainTileAssetCooker.BuildTile(
+                            root,
+                            layerSet,
+                            heightField,
+                            root.GeneratedTiles[rebuild[offset]],
+                            weightField);
+                    }
+                    catch (Exception failure)
+                    {
+                        buildFailures[offset] = failure;
+                    }
+                });
+
+            // The lowest coordinate that failed is the one reported, so a rejected tile fails the cook
+            // with the same exception type and message a sequential build would have produced.
+            for (int offset = 0; offset < buildFailures.Length; offset++)
+            {
+                if (buildFailures[offset] is Exception failure)
+                {
+                    System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
+                }
+            }
+
+            // Shared borders are validated over the whole grid, reused and rebuilt tiles alike, and a
+            // rebuilt tile is never published before validation has seen the new payload.
+            TerrainTileAssetCooker.ValidateSharedBorders(tiles);
+            foreach (int index in rebuild)
+            {
+                tileArtifacts[index] = TerrainTileAssetCooker.Cook(assetDatabase, tiles[index]);
             }
         }
 
-        TerrainTileAssetCooker.ValidateSharedBorders(tiles);
-        var tileArtifacts = new CookedTerrainTileArtifact[tiles.Length];
-        for (int index = 0; index < tiles.Length; index++)
+        return new TerrainRootCookReport(
+            WriteRootArtifact(
+                assetDatabase,
+                root,
+                layerSet,
+                tileArtifacts,
+                previousRoot),
+            ReusedRoot: false,
+            reusedTiles.ToArray(),
+            rebuild.Select(index => root.GeneratedTiles[index].Coordinate).ToArray());
+    }
+
+    /// <summary>
+    /// True when the cooked root still describes this descriptor and every tile it names is still
+    /// current. The root payload is then rebuilt from the references the cooked root already carries,
+    /// which reproduces the same bytes without decoding the raster or loading a tile payload.
+    /// </summary>
+    private static bool TryReuseRoot(
+        IAssetDatabase assetDatabase,
+        TerrainRootSourceDescriptor root,
+        TerrainLayerSetSourceDescriptor layerSet,
+        CookedTerrainRoot previousRoot,
+        out CookedTerrainRootArtifact artifact)
+    {
+        artifact = null!;
+        if (previousRoot.Guid != root.Guid ||
+            !string.Equals(previousRoot.PackageId, root.PackageId, StringComparison.Ordinal) ||
+            previousRoot.SourceSchemaVersion != root.SourceSchemaVersion ||
+            !string.Equals(previousRoot.Name, root.Name, StringComparison.Ordinal) ||
+            previousRoot.WorldPlacement != root.WorldPlacement ||
+            previousRoot.SampleSpacing != root.SampleSpacing ||
+            previousRoot.HeightRange != root.HeightRange ||
+            previousRoot.HeightSourceWidth != root.HeightSource.Width ||
+            previousRoot.HeightSourceHeight != root.HeightSource.Height ||
+            previousRoot.TileResolution != root.TileResolution ||
+            previousRoot.BorderPolicy != root.BorderPolicy ||
+            previousRoot.TileOrigin != root.TileOrigin ||
+            previousRoot.LayerSetGuid != layerSet.Guid ||
+            !string.Equals(previousRoot.LayerSetPackageId, layerSet.PackageId, StringComparison.Ordinal) ||
+            previousRoot.Layers.Count != layerSet.Layers.Count ||
+            previousRoot.Tiles.Count != root.GeneratedTiles.Count)
         {
-            tileArtifacts[index] = TerrainTileAssetCooker.Cook(assetDatabase, tiles[index]);
+            return false;
         }
 
-        return WriteRootArtifact(
+        DateTime newestSourceWriteTimeUtc = TerrainCookStaleness.GetNewestSourceWriteTimeUtc(
             assetDatabase,
             root,
-            layerSet,
-            tileArtifacts,
-            previousRoot);
+            layerSet);
+        if (!TerrainCookStaleness.TryGetCurrentCookedArtifact(
+                assetDatabase,
+                root.Guid,
+                RuntimeVariant,
+                newestSourceWriteTimeUtc,
+                out _))
+        {
+            return false;
+        }
+
+        var tileArtifacts = new CookedTerrainTileArtifact[previousRoot.Tiles.Count];
+        for (int index = 0; index < previousRoot.Tiles.Count; index++)
+        {
+            CookedTerrainTileReference reference = previousRoot.Tiles[index];
+            TerrainGeneratedTileRecord record = root.GeneratedTiles[index];
+            if (reference.Coordinate != record.Coordinate ||
+                reference.Guid != record.Guid ||
+                !TerrainCookStaleness.TryGetCurrentCookedArtifact(
+                    assetDatabase,
+                    reference.Guid,
+                    TerrainTileAssetCooker.RuntimeVariant,
+                    newestSourceWriteTimeUtc,
+                    out CookedAssetRecord tileArtifact))
+            {
+                return false;
+            }
+
+            tileArtifacts[index] = new CookedTerrainTileArtifact(
+                reference.Guid,
+                root.Guid,
+                reference.Coordinate,
+                TerrainTileAssetCooker.RuntimeVariant,
+                tileArtifact.Path,
+                reference.PayloadBytes,
+                reference.MinHeight,
+                reference.MaxHeight,
+                reference.ContentHash.ToArray());
+        }
+
+        artifact = WriteRootArtifact(assetDatabase, root, layerSet, tileArtifacts, previousRoot);
+        return true;
     }
 
     public static TerrainIncrementalCookResult CookChangedTiles(
@@ -177,6 +412,7 @@ public static class TerrainRootAssetCooker
                     root,
                     layerSet,
                     record,
+                    newestSourceWriteTimeUtc: null,
                     out CookedTerrainTile reusedTile,
                     out CookedTerrainTileArtifact reusedArtifact))
             {
@@ -218,11 +454,18 @@ public static class TerrainRootAssetCooker
             Array.AsReadOnly(reused.ToArray()));
     }
 
-    private static bool TryReuseTileArtifact(
+    /// <summary>
+    /// Loads a published tile and accepts it when it still matches the descriptor it was built from.
+    /// <paramref name="newestSourceWriteTimeUtc"/> is the caller's staleness stamp: the full cook and
+    /// the tile cook pass the raster's newest source write time so a stale tile is rebuilt, while the
+    /// incremental authoring path passes null because its caller already decided which tiles changed.
+    /// </summary>
+    internal static bool TryReuseTileArtifact(
         IAssetDatabase assetDatabase,
         TerrainRootSourceDescriptor root,
         TerrainLayerSetSourceDescriptor layerSet,
         TerrainGeneratedTileRecord record,
+        DateTime? newestSourceWriteTimeUtc,
         out CookedTerrainTile tile,
         out CookedTerrainTileArtifact artifact)
     {
@@ -243,6 +486,14 @@ public static class TerrainRootAssetCooker
                 TerrainTileAssetCooker.RuntimeVariant,
                 out CookedAssetRecord? cookedRecord) ||
             !File.Exists(cookedRecord.Path))
+        {
+            tile = null!;
+            artifact = null!;
+            return false;
+        }
+
+        if (newestSourceWriteTimeUtc != null &&
+            File.GetLastWriteTimeUtc(cookedRecord.Path) < newestSourceWriteTimeUtc.Value)
         {
             tile = null!;
             artifact = null!;
